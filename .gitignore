@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.Python
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+*.key
+
+# Database & Testing
+database/*.db
+database/*.db-*
+database/export_*.json
+test_*.db
+
+# Logs & Temporary Files
+logs/
+*.log
+*.tmp
+*_temp.py
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+*.tmp~
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Test Files & Uploads
+test_files/
+test_uploads/
+uploads/
+
+# Virtual Environment
+.venv
+venv
+ENV/
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Package files
+*.egg
+*.eggs
