@@ -6,6 +6,7 @@ Run this script to install all required Python dependencies
 
 import subprocess
 import sys
+import argparse
 from pathlib import Path
 
 # Reconfigure stdout/stderr to UTF-8 to avoid UnicodeEncodeErrors on Windows terminals with emojis
@@ -21,6 +22,57 @@ try:
 except ImportError:
     pass
 
+GLINER_MODEL_CHOICES = [
+    "urchade/gliner_small-v2.1",
+    "urchade/gliner_base-v2.1",
+    "urchade/gliner_medium-v2.1",
+    "urchade/gliner_large-v2.1",
+]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Install IntelliSafe dependencies")
+    parser.add_argument(
+        "--gliner-model",
+        default=GLINER_MODEL_CHOICES[1],
+        choices=GLINER_MODEL_CHOICES,
+        help="GLiNER model to prefetch after installation",
+    )
+    parser.add_argument(
+        "--skip-gliner-download",
+        action="store_true",
+        help="Install packages only and skip GLiNER model prefetch",
+    )
+    return parser.parse_args()
+
+
+def prefetch_gliner_model(project_path: Path, model_name: str) -> bool:
+    """Attempt to download/cache the selected GLiNER model."""
+    print("\n" + "=" * 70)
+    print(f"🧠 Prefetching GLiNER model: {model_name}")
+    print("=" * 70)
+
+    probe = f"""
+from gliner import GLiNER
+if hasattr(GLiNER, 'from_pretrained'):
+    model = GLiNER.from_pretrained({model_name!r})
+else:
+    model = GLiNER({model_name!r})
+print('Loaded:', {model_name!r})
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=str(project_path),
+        check=False,
+    )
+
+    if result.returncode == 0:
+        print(f"✅ GLiNER model cached: {model_name}")
+        return True
+
+    print(f"⚠️  Could not prefetch GLiNER model: {model_name}")
+    print("   The model will be downloaded on first use if the package supports it.")
+    return False
 
 
 def install_dependencies():
@@ -47,6 +99,8 @@ def install_dependencies():
     print("🚀 Starting dependency installation...")
     print("=" * 70)
     
+    args = parse_args()
+
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "-r", str(requirements_file), "--upgrade"],
@@ -62,6 +116,8 @@ def install_dependencies():
             print("   1. Run the application: python main.py")
             print("   2. Read QUICKSTART.md for getting started")
             print("   3. Test file upload functionality")
+            if not args.skip_gliner_download:
+                prefetch_gliner_model(project_path, args.gliner_model)
             return True
         else:
             print("\n" + "=" * 70)
@@ -69,8 +125,9 @@ def install_dependencies():
             print("=" * 70)
             print("\n📝 You may need to install some packages manually:")
             print("   pip install PyQt6")
-            print("   pip install spacy")
-            print("   python -m spacy download en_core_web_md")
+            print("   pip install gliner presidio-analyzer")
+            if not args.skip_gliner_download:
+                prefetch_gliner_model(project_path, args.gliner_model)
             return False
             
     except Exception as e:
@@ -85,7 +142,8 @@ def check_critical_packages():
     
     critical_packages = {
         'PyQt6': 'UI Framework',
-        'spacy': 'NLP Processing',
+        'gliner': 'Graph-based NER (GLiNER)',
+        'presidio_analyzer': 'Presidio Analyzer',
         'transformers': 'ML Models',
         'fitz': 'PDF Processing (PyMuPDF)',
         'docx': 'Word Documents (python-docx)',

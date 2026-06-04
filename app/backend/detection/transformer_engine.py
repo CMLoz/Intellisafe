@@ -1,5 +1,10 @@
-"""Transformer-based validation using DistilBERT NER."""
+"""Transformer-based validation using DistilBERT NER.
 
+This module provides an optional validation step that consumes findings
+from upstream detectors (regex, GLiNER, Presidio, aggregated records)
+and attaches `transformer_confidence` and `transformer_validated` flags
+based on a token-classification model.
+"""
 from __future__ import annotations
 
 import logging
@@ -11,10 +16,15 @@ logger = logging.getLogger(__name__)
 
 
 class TransformerEngine:
-    """Validate spaCy entities with a DistilBERT NER model."""
+    """Validate findings using a DistilBERT token-classification model."""
 
     DEFAULT_MODEL = "elastic/distilbert-base-uncased-finetuned-conll03-english"
     LABEL_MAP = {
+        "PERSON": "PER",
+        "ORG": "ORG",
+        "GPE": "LOC",
+        "LOC": "LOC",
+        "FAC": "LOC",
         "Person Name": "PER",
         "Organization": "ORG",
         "Location": "LOC",
@@ -58,34 +68,38 @@ class TransformerEngine:
         )
 
     def validate(self, findings: List[Dict]) -> List[Dict]:
-        """Attach transformer confidence to spaCy findings."""
+        """Attach transformer confidence to findings irrespective of source.
+
+        The transformer model operates on the `context` field of a finding.
+        If a mapping to expected NER labels exists we use it; otherwise the
+        highest matching score is used heuristically.
+        """
         if not findings:
             return findings
 
         for finding in findings:
-            if finding.get("engine") != "spacy":
-                finding["transformer_confidence"] = None
-                finding["transformer_validated"] = None
-                continue
-
-            expected = self.LABEL_MAP.get(finding.get("type"))
-            if not expected:
-                finding["transformer_confidence"] = 0.0
-                finding["transformer_validated"] = False
-                continue
+            finding["transformer_confidence"] = 0.0
+            finding["transformer_validated"] = False
 
             context = finding.get("context", "")
             if not context:
-                finding["transformer_confidence"] = 0.0
-                finding["transformer_validated"] = False
                 continue
 
-            entities = self._pipeline(context)
+            expected = self.LABEL_MAP.get(str(finding.get("type")))
+
+            try:
+                entities = self._pipeline(context)
+            except Exception:
+                continue
+
             best_score = 0.0
             for entity in entities:
                 label = entity.get("entity_group", "")
-                if label == expected:
-                    score = float(entity.get("score", 0.0))
+                score = float(entity.get("score", 0.0))
+                if expected:
+                    if label == expected:
+                        best_score = max(best_score, score)
+                else:
                     best_score = max(best_score, score)
 
             finding["transformer_confidence"] = best_score

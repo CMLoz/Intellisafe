@@ -286,7 +286,7 @@ class DatabaseManager:
         
         Args:
             file_id: ID of the file
-            detection_type: Type of detection (regex, spacy, transformer)
+            detection_type: Type of detection (regex, gliner, presidio, transformer)
             pattern_matched: Pattern that matched
             data_found: Actual data found (may be masked)
             location_info: Where in file it was found

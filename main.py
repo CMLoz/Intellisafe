@@ -197,7 +197,7 @@ QScrollBar::handle:vertical:hover {
 class FileHandler:
     """Handle file uploads and validation"""
     
-    SUPPORTED_FORMATS = {'.pdf', '.png', '.jpg', '.jpeg', '.docx', '.sql', '.txt'}
+    SUPPORTED_FORMATS = {'.pdf', '.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.docx', '.sql', '.txt'}
     MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
     
     @staticmethod
@@ -235,7 +235,7 @@ class FileHandler:
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QLabel, QFrame, QFileDialog, QListWidget, QListWidgetItem, QScrollArea,
-    QTextEdit, QCheckBox, QComboBox
+    QTextEdit, QCheckBox, QComboBox, QSizePolicy, QDialog
 )
 from PyQt6.QtCore import Qt, QSize, QMimeData, QTimer, pyqtSignal, QObject, QThread
 from PyQt6.QtGui import QIcon, QFont, QDrag, QColor, QDropEvent, QPixmap
@@ -376,12 +376,28 @@ class FileListWidget(QWidget):
         except ImportError:
             logger.error("Could not import FileParser or ValidationPipeline")
             return
+
+        host = self.window()
         
         for file_path in files:
             # Validate file
             valid, msg = FileHandler.validate_file(file_path)
             if not valid:
                 logger.warning(f"Invalid file {file_path}: {msg}")
+                continue
+
+            suffix = file_path.suffix.lower()
+            is_image = suffix in {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
+
+            if is_image and host is not None and hasattr(host, "perform_image_ocr"):
+                logger.info("Routing image upload through OCR flow: %s", file_path.name)
+                ocr_info = host.perform_image_ocr(file_path)
+                if ocr_info is None:
+                    logger.info("OCR canceled for %s", file_path.name)
+                    continue
+
+                self.refresh_list()
+                logger.info(f"File added to list: {ocr_info['name']}")
                 continue
             
             info = FileHandler.get_file_info(file_path)
@@ -439,6 +455,102 @@ class FileListWidget(QWidget):
         self.list_widget.clear()
         logger.info("Files cleared")
 
+
+class ImageOCRPromptDialog(QDialog):
+    """Prompt for OCR preprocessing options when an image is uploaded."""
+
+    def __init__(self, file_path: Path, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.setWindowTitle(f"OCR Options - {file_path.name}")
+        self.setModal(True)
+        self.selected_steps: list[str] = []
+        self.selected_language = "eng"
+        self.selected_scan_mode = "standard"
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(14)
+
+        title = QLabel(f"OCR preprocessing for {self.file_path.name}")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        subtitle = QLabel("Choose image preprocessing before IntelliSafe extracts text and runs detection.")
+        subtitle.setObjectName("subtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        form_row = QHBoxLayout()
+
+        language_label = QLabel("Language")
+        form_row.addWidget(language_label)
+        self.language_combo = QComboBox()
+        for language in ["eng", "eng+spa", "spa", "fra", "deu"]:
+            self.language_combo.addItem(language)
+        form_row.addWidget(self.language_combo)
+
+        scan_label = QLabel("Scan Mode")
+        form_row.addWidget(scan_label)
+        self.scan_mode_combo = QComboBox()
+        self.scan_mode_combo.addItem("Quick Scan", "quick")
+        self.scan_mode_combo.addItem("Standard", "standard")
+        self.scan_mode_combo.addItem("Deep Analysis", "deep")
+        self.scan_mode_combo.setCurrentIndex(1)
+        form_row.addWidget(self.scan_mode_combo)
+
+        form_row.addStretch()
+        layout.addLayout(form_row)
+
+        steps_title = QLabel("Preprocessing")
+        steps_title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        layout.addWidget(steps_title)
+
+        self.step_checkboxes: dict[str, QCheckBox] = {}
+        steps_layout = QHBoxLayout()
+        default_steps = {"resize", "denoise_fastNlMeans", "contrast_clahe", "deskew"}
+        for step, label in [
+            ("resize", "Resize"),
+            ("grayscale", "Grayscale"),
+            ("threshold_otsu", "Otsu Threshold"),
+            ("threshold_adaptive", "Adaptive Threshold"),
+            ("denoise_fastNlMeans", "Denoise (FastNLMeans)"),
+            ("denoise_bilateral", "Denoise (Bilateral)"),
+            ("denoise_morphological", "Morphology"),
+            ("contrast_clahe", "CLAHE Contrast"),
+            ("deskew", "Deskew"),
+            ("sharpen", "Sharpen"),
+            ("invert", "Invert"),
+        ]:
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(step in default_steps)
+            self.step_checkboxes[step] = checkbox
+            steps_layout.addWidget(checkbox)
+
+        steps_layout.addStretch()
+        layout.addLayout(steps_layout)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        actions.addWidget(cancel_btn)
+        process_btn = QPushButton("Process Image")
+        process_btn.clicked.connect(self.accept)
+        actions.addWidget(process_btn)
+        layout.addLayout(actions)
+
+    def get_settings(self) -> dict:
+        steps = [step for step, checkbox in self.step_checkboxes.items() if checkbox.isChecked()]
+        if not steps:
+            steps = ["grayscale"]
+        return {
+            "selected_steps": steps,
+            "language": self.language_combo.currentText(),
+            "scan_mode": self.scan_mode_combo.currentData(),
+        }
+
 # ============================================================================
 # MAIN WINDOW
 # ============================================================================
@@ -453,9 +565,9 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLESHEET)
         self.current_page = "upload"
         self.uploaded_files = []
-        self.ocr_image_path = None
-        self.ocr_results = []
-        self.ocr_step_checkboxes = {}
+        self.findings_file_list = None
+        self.findings_findings_output = None
+        self.findings_text_output = None
         
         # Create central widget
         central_widget = QWidget()
@@ -502,7 +614,7 @@ class MainWindow(QMainWindow):
             ("✓ Compliance", "compliance"),
             ("🛡️ Protection", "protection"),
             ("⚙️ Detection", "detection"),
-            ("OCR", "ocr"),
+            ("🔎 Findings", "findings"),
             ("📋 Reports", "reports"),
         ]
         
@@ -545,8 +657,8 @@ class MainWindow(QMainWindow):
             self.show_protection_page()
         elif page_id == "detection":
             self.show_detection_page()
-        elif page_id == "ocr":
-            self.show_ocr_page()
+        elif page_id == "findings":
+            self.show_findings_page()
         elif page_id == "reports":
             self.show_reports_page()
 
@@ -584,7 +696,7 @@ class MainWindow(QMainWindow):
         layout.addSpacing(30)
         
         # File list
-        self.file_list = FileListWidget(self.uploaded_files)
+        self.file_list = FileListWidget(self.uploaded_files, self)
         layout.addWidget(self.file_list)
         
         layout.addStretch()
@@ -832,7 +944,7 @@ class MainWindow(QMainWindow):
         
         for engine, desc in [
             ("Regex Engine", "Pattern matching - SSN, CC, email, phone formats"),
-            ("spaCy NER", "Named entity recognition - en-core-web-md"),
+            ("GLiNER NER", "Graph-enhanced NER - GLiNER"),
             ("Transformer AI", "DistilBERT - Contextual semantic detection"),
         ]:
             card = QFrame()
@@ -858,8 +970,8 @@ class MainWindow(QMainWindow):
         
         for model, desc in [
             ("DistilBERT", "Transformer - 256 MB, ~42ms avg"),
-            ("spaCy en-core-web-md", "NER Pipeline - 80 MB, ~45ms avg"),
-            ("MiniLM", "Sentence Embeddings - 45 MB, ~8ms avg"),
+            ("GLiNER", "Graph-augmented NER - model dependent"),
+            ("Presidio Analyzer", "Recognizer-based contextual detection"),
         ]:
             card = QFrame()
             card.setObjectName("card")
@@ -881,205 +993,50 @@ class MainWindow(QMainWindow):
         
         layout.addStretch()
 
-    def show_ocr_page(self):
-        """Display OCR processing page"""
-        layout = self.content_layout
-        layout.setContentsMargins(40, 40, 40, 40)
+    def prompt_image_ocr_settings(self, file_path: Path) -> dict | None:
+        """Prompt the user for OCR preprocessing options before running OCR."""
+        dialog = ImageOCRPromptDialog(file_path, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.get_settings()
 
-        title = QLabel("OCR Processing")
-        title.setObjectName("title")
-        layout.addWidget(title)
-
-        subtitle = QLabel("Extract text from image files using Tesseract OCR")
-        subtitle.setObjectName("subtitle")
-        layout.addWidget(subtitle)
-
-        layout.addSpacing(24)
-
-        controls_layout = QHBoxLayout()
-
-        select_btn = QPushButton("Select Image")
-        select_btn.clicked.connect(self.select_ocr_image)
-        controls_layout.addWidget(select_btn)
-
-        run_btn = QPushButton("Run OCR")
-        run_btn.clicked.connect(self.run_ocr_processing)
-        controls_layout.addWidget(run_btn)
-
-        language_label = QLabel("Language")
-        controls_layout.addWidget(language_label)
-
-        self.ocr_language_combo = QComboBox()
-        for language in ["eng", "eng+spa", "spa", "fra", "deu"]:
-            self.ocr_language_combo.addItem(language)
-        controls_layout.addWidget(self.ocr_language_combo)
-
-        scan_mode_label = QLabel("Scan Mode")
-        controls_layout.addWidget(scan_mode_label)
-
-        self.ocr_scan_mode_combo = QComboBox()
-        self.ocr_scan_mode_combo.addItem("Quick Scan", "quick")
-        self.ocr_scan_mode_combo.addItem("Standard", "standard")
-        self.ocr_scan_mode_combo.addItem("Deep Analysis", "deep")
-        self.ocr_scan_mode_combo.setCurrentIndex(1)
-        controls_layout.addWidget(self.ocr_scan_mode_combo)
-
-        controls_layout.addStretch()
-        layout.addLayout(controls_layout)
-
-        self.ocr_status_label = QLabel("Select an image to begin.")
-        self.ocr_status_label.setObjectName("subtitle")
-        layout.addWidget(self.ocr_status_label)
-
-        if self.ocr_image_path:
-            self.ocr_status_label.setText(f"Selected: {Path(self.ocr_image_path).name}")
-
-        layout.addSpacing(16)
-
-        steps_title = QLabel("Preprocessing")
-        steps_title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-        layout.addWidget(steps_title)
-
-        steps_layout = QHBoxLayout()
-        self.ocr_step_checkboxes = {}
-        default_steps = {"grayscale", "threshold_otsu", "sharpen"}
-        for step, label in [
-            ("grayscale", "Grayscale"),
-            ("threshold_otsu", "Otsu Threshold"),
-            ("threshold_adaptive", "Adaptive Threshold"),
-            ("denoise_bilateral", "Denoise"),
-            ("denoise_morphological", "Morphology"),
-            ("sharpen", "Sharpen"),
-            ("invert", "Invert"),
-        ]:
-            checkbox = QCheckBox(label)
-            checkbox.setChecked(step in default_steps)
-            self.ocr_step_checkboxes[step] = checkbox
-            steps_layout.addWidget(checkbox)
-
-        steps_layout.addStretch()
-        layout.addLayout(steps_layout)
-
-        layout.addSpacing(20)
-
-        content_layout = QHBoxLayout()
-
-        preview_card = QFrame()
-        preview_card.setObjectName("card")
-        preview_layout = QVBoxLayout(preview_card)
-
-        preview_title = QLabel("Image Preview")
-        preview_title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
-        preview_layout.addWidget(preview_title)
-
-        self.ocr_image_preview = QLabel("No image selected")
-        self.ocr_image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.ocr_image_preview.setMinimumHeight(320)
-        self.ocr_image_preview.setStyleSheet("border: 1px solid #334155; color: #a0aec0;")
-        preview_layout.addWidget(self.ocr_image_preview)
-
-        content_layout.addWidget(preview_card, 1)
-
-        output_card = QFrame()
-        output_card.setObjectName("card")
-        output_layout = QVBoxLayout(output_card)
-
-        output_title = QLabel("Extracted Text")
-        output_title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
-        output_layout.addWidget(output_title)
-
-        self.ocr_text_output = QTextEdit()
-        self.ocr_text_output.setReadOnly(True)
-        self.ocr_text_output.setPlaceholderText("OCR output will appear here.")
-        output_layout.addWidget(self.ocr_text_output)
-
-        content_layout.addWidget(output_card, 1)
-        layout.addLayout(content_layout)
-
-        if self.ocr_image_path:
-            self.update_ocr_image_preview()
-
-        if self.ocr_results:
-            latest = self.ocr_results[-1]
-            self.display_ocr_result(latest)
-
-        layout.addStretch()
-
-    def select_ocr_image(self):
-        """Select an image for OCR processing."""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select image for OCR",
-            "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.tiff *.tif);;All Files (*)"
-        )
-        if not file_path:
-            return
-
-        self.ocr_image_path = file_path
-        self.ocr_status_label.setText(f"Selected: {Path(file_path).name}")
-        self.ocr_text_output.clear()
-        self.update_ocr_image_preview()
-
-    def update_ocr_image_preview(self):
-        """Refresh the OCR image preview."""
-        if not self.ocr_image_path:
-            return
-
-        pixmap = QPixmap(self.ocr_image_path)
-        if pixmap.isNull():
-            self.ocr_image_preview.setText("Could not preview selected image.")
-            return
-
-        scaled = pixmap.scaled(
-            self.ocr_image_preview.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        self.ocr_image_preview.setPixmap(scaled)
-
-    def run_ocr_processing(self):
-        """Run OCR and store results in the shared file state."""
-        if not self.ocr_image_path:
-            self.ocr_status_label.setText("Select an image before running OCR.")
-            return
-
-        selected_steps = [
-            step
-            for step, checkbox in self.ocr_step_checkboxes.items()
-            if checkbox.isChecked()
-        ]
-        if not selected_steps:
-            selected_steps = ["grayscale"]
-
-        language = self.ocr_language_combo.currentText()
+    def perform_image_ocr(self, file_path: Path) -> dict | None:
+        """Run OCR for an uploaded image and store the result in the shared list."""
+        settings = self.prompt_image_ocr_settings(file_path)
+        if settings is None:
+            return None
 
         try:
             from app.backend.ocr_processor import OCRPipeline
             from app.backend.detection import ValidationPipeline
+        except ImportError as exc:
+            logger.error("Could not import OCRPipeline or ValidationPipeline: %s", exc)
+            file_info = FileHandler.get_file_info(file_path)
+            file_info['parse_error'] = str(exc)
+            self.uploaded_files.append(file_info)
+            return file_info
 
-            self.ocr_status_label.setText("Running OCR...")
-            QApplication.processEvents()
-
-            pipeline = OCRPipeline(language=language)
-            result = pipeline.process(self.ocr_image_path, selected_steps)
-            scan_mode = self.ocr_scan_mode_combo.currentData()
+        try:
             if not hasattr(self, "validation_pipeline"):
                 self.validation_pipeline = ValidationPipeline()
-            validation = self.validation_pipeline.run(result.get('text', ''), mode=scan_mode)
+
+            logger.info("Running OCR for image: %s", file_path.name)
+            pipeline = OCRPipeline(language=settings['language'])
+            result = pipeline.process(str(file_path), settings['selected_steps'])
+            validation = self.validation_pipeline.run(result.get('text', ''), mode=settings['scan_mode'])
             findings = validation['findings']
 
             ocr_record = {
-                'file_path': self.ocr_image_path,
-                'file_name': Path(self.ocr_image_path).name,
+                'file_path': str(file_path),
+                'file_name': file_path.name,
                 'text': result.get('text', ''),
                 'confidence': result.get('confidence', 0),
                 'word_count': result.get('word_count', 0),
-                'engine': result.get('engine', 'tesseract'),
+                'engine': result.get('engine', 'paddleocr'),
                 'fallback_used': result.get('fallback_used', False),
-                'preprocessing_steps': result.get('preprocessing_steps_used', selected_steps),
-                'language': language,
-                'scan_mode': scan_mode,
+                'preprocessing_steps': result.get('preprocessing_steps_used', settings['selected_steps']),
+                'language': settings['language'],
+                'scan_mode': settings['scan_mode'],
                 'validation_tier': validation['validation_tier'],
                 'confidence_breakdown': validation['confidence_breakdown'],
                 'findings': findings,
@@ -1087,46 +1044,155 @@ class MainWindow(QMainWindow):
                 'regex_findings': findings,
                 'regex_summary': validation['summary'],
             }
-            self.ocr_results.append(ocr_record)
-            self.store_ocr_result_as_uploaded_file(ocr_record)
-            self.display_ocr_result(ocr_record)
 
-            self.ocr_status_label.setText(
-                f"OCR complete: {ocr_record['word_count']} words, "
-                f"{ocr_record['confidence']:.1f}% confidence, "
-                f"{len(findings)} findings ({scan_mode})"
+            file_info = self.store_ocr_result_as_uploaded_file(ocr_record)
+            self.refresh_findings_page()
+            logger.info(
+                "OCR completed for %s: %s words, %s findings",
+                file_path.name,
+                ocr_record['word_count'],
+                len(findings),
             )
-            logger.info(f"OCR completed for {ocr_record['file_name']}")
-        except Exception as e:
-            error_msg = f"OCR failed: {str(e)}"
-            self.ocr_status_label.setText(error_msg)
-            self.ocr_text_output.setPlainText(error_msg)
-            logger.error(error_msg)
+            return file_info
+        except Exception as exc:
+            logger.error("OCR failed for %s: %s", file_path.name, exc)
+            file_info = FileHandler.get_file_info(file_path)
+            file_info['parse_error'] = str(exc)
+            self.uploaded_files.append(file_info)
+            return file_info
 
-    def display_ocr_result(self, result: dict):
-        """Display OCR result details."""
-        finding_lines = []
-        findings = result.get('findings', result.get('regex_findings', []))
-        for index, finding in enumerate(findings, start=1):
-            finding_lines.append(
-                f"{index}. {finding['type']} ({finding['severity']}) "
-                f"line {finding['line']}: {finding['masked_value']}\n"
-                f"   Context: {finding['context']}"
+    def refresh_findings_page(self):
+        """Refresh the Findings page list and displayed details."""
+        if self.findings_file_list is None:
+            return
+
+        self.findings_file_list.clear()
+        for index, file_info in enumerate(self.uploaded_files):
+            if 'parse_error' in file_info:
+                item_text = f"{file_info['name']} - Parse Error"
+            elif 'parsed_content' in file_info:
+                finding_count = len(file_info.get('regex_findings', []))
+                item_text = f"{file_info['name']} - {finding_count} findings"
+            else:
+                item_text = f"{file_info['name']} - Pending"
+
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            self.findings_file_list.addItem(item)
+
+        if self.uploaded_files:
+            self.findings_file_list.setCurrentRow(0)
+        else:
+            if self.findings_findings_output is not None:
+                self.findings_findings_output.setPlainText("No uploaded files yet.")
+            if self.findings_text_output is not None:
+                self.findings_text_output.clear()
+
+    def show_findings_page(self):
+        """Display the unified findings page."""
+        layout = self.content_layout
+        layout.setContentsMargins(40, 40, 40, 40)
+
+        title = QLabel("Findings")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        subtitle = QLabel("Uploaded files, OCR output, and detection findings in one place")
+        subtitle.setObjectName("subtitle")
+        layout.addWidget(subtitle)
+
+        layout.addSpacing(24)
+
+        review_layout = QHBoxLayout()
+
+        self.findings_file_list = QListWidget()
+        self.findings_file_list.setMinimumWidth(320)
+        self.findings_file_list.setMaximumWidth(420)
+
+        right_card = QFrame()
+        right_card.setObjectName("card")
+        right_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        right_layout = QVBoxLayout(right_card)
+
+        findings_title = QLabel("Findings")
+        findings_title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        right_layout.addWidget(findings_title)
+
+        self.findings_findings_output = QTextEdit()
+        self.findings_findings_output.setReadOnly(True)
+        self.findings_findings_output.setPlaceholderText("Select a file to view findings.")
+        right_layout.addWidget(self.findings_findings_output, 1)
+
+        extracted_title = QLabel("Extracted Text")
+        extracted_title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        right_layout.addWidget(extracted_title)
+
+        self.findings_text_output = QTextEdit()
+        self.findings_text_output.setReadOnly(True)
+        self.findings_text_output.setPlaceholderText("Select a file to view extracted text.")
+        right_layout.addWidget(self.findings_text_output, 2)
+
+        def show_selected_finding():
+            selected_items = self.findings_file_list.selectedItems()
+            if not selected_items:
+                return
+
+            file_index = selected_items[0].data(Qt.ItemDataRole.UserRole)
+            if file_index is None:
+                return
+
+            file_info = self.uploaded_files[file_index]
+            self.display_finding_details(file_info)
+
+        self.findings_file_list.itemSelectionChanged.connect(show_selected_finding)
+        self.refresh_findings_page()
+
+        review_layout.addWidget(self.findings_file_list)
+        review_layout.addWidget(right_card, 1)
+        layout.addLayout(review_layout)
+
+        layout.addStretch()
+
+    def display_finding_details(self, file_info: dict):
+        """Render findings and extracted text for a selected uploaded file."""
+        if self.findings_findings_output is None or self.findings_text_output is None:
+            return
+
+        if 'parse_error' in file_info:
+            self.findings_findings_output.setPlainText(
+                f"Could not process {file_info['name']}.\n\nError: {file_info['parse_error']}"
             )
+            self.findings_text_output.clear()
+            return
 
-        findings_text = "\n".join(finding_lines) if finding_lines else "No findings detected."
-        text = (
-            f"File: {result['file_name']}\n"
-            f"Language: {result['language']}\n"
-            f"Confidence: {result['confidence']:.1f}%\n"
-            f"Word Count: {result['word_count']}\n"
-            f"Preprocessing: {', '.join(result['preprocessing_steps'])}\n\n"
-            f"Scan Mode: {result.get('scan_mode', 'standard')}\n"
-            f"Validation Tier: {result.get('validation_tier', 'standard')}\n\n"
-            f"Findings:\n{findings_text}\n\n"
-            f"Extracted Text:\n\n{result['text']}"
-        )
-        self.ocr_text_output.setPlainText(text)
+        content = file_info.get('parsed_content', '')
+        findings = file_info.get('regex_findings', [])
+        metadata = file_info.get('parsed_metadata', {})
+
+        findings_lines = []
+        if findings:
+            for index, finding in enumerate(findings, start=1):
+                findings_lines.append(
+                    f"{index}. {finding.get('type', 'Unknown')} ({finding.get('severity', 'medium')}) "
+                    f"line {finding.get('line', '?')}: {finding.get('masked_value', finding.get('value', ''))}\n"
+                    f"   Context: {finding.get('context', '')}"
+                )
+        else:
+            findings_lines.append("No findings detected.")
+
+        metadata_lines = [
+            f"{key}: {value}"
+            for key, value in metadata.items()
+            if value not in (None, "")
+        ]
+
+        findings_text = "\n\n".join([
+            "Findings:\n" + "\n".join(findings_lines),
+            "Metadata:\n" + ("\n".join(metadata_lines) if metadata_lines else "No metadata available."),
+        ])
+
+        self.findings_findings_output.setPlainText(findings_text)
+        self.findings_text_output.setPlainText(content or "No extracted text available.")
 
     def store_ocr_result_as_uploaded_file(self, result: dict):
         """Add or update an OCR image in the shared uploaded file list."""
@@ -1163,6 +1229,7 @@ class MainWindow(QMainWindow):
             self.uploaded_files.append(file_info)
         else:
             self.uploaded_files[existing_index] = file_info
+        return file_info
     
     def show_reports_page(self):
         """Display reports page"""
@@ -1410,6 +1477,8 @@ class MainWindow(QMainWindow):
         """Handle files dropped/selected"""
         logger.info(f"Files received: {len(files)}")
         self.file_list.add_files(files)
+        if self.current_page == "findings" and self.findings_file_list is not None:
+            self.refresh_findings_page()
 
 # ============================================================================
 # MAIN
