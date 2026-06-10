@@ -17,6 +17,53 @@ class PresidioEngine:
     DEFAULT_LANGUAGE = "en"
     DEFAULT_LANGUAGES = ("en",)
 
+    ENTITY_MAP = {
+        "EMAIL_ADDRESS": "Email",
+        "PHONE_NUMBER": "Phone Number",
+        "CREDIT_CARD": "Credit Card",
+        "US_SSN": "ID Number",
+        "US_PASSPORT": "ID Number",
+        "US_DRIVER_LICENSE": "ID Number",
+        "IBAN_CODE": "Bank Account",
+        "IP_ADDRESS": "IP Address",
+        "API_TOKEN": "API Key",
+        "PERSON": "Person Name",
+        "LOCATION": "Location",
+        "ORGANIZATION": "Organization",
+        "NRP": "ID Number",
+        "DATE_TIME": "Date of Birth",
+        "MEDICAL_LICENSE": "ID Number",
+        "CRYPTO": "API Key",
+        "URL": "URL",
+    }
+
+    HIGH_RISK_ENTITIES = {
+        "CREDIT_CARD",
+        "US_SSN",
+        "US_PASSPORT",
+        "US_DRIVER_LICENSE",
+        "IBAN_CODE",
+        "API_TOKEN",
+        "MEDICAL_LICENSE",
+        "CRYPTO",
+    }
+
+    MEDIUM_RISK_ENTITIES = {
+        "EMAIL_ADDRESS",
+        "PHONE_NUMBER",
+        "IP_ADDRESS",
+        "DATE_TIME",
+        "NRP",
+    }
+
+    # spaCy NER types that produce noisy detections on field labels.
+    # Only keep these when Presidio's score meets the higher bar.
+    SPACY_NER_TYPES = {"ORGANIZATION", "PERSON", "LOCATION", "URL", "NRP"}
+    SPACY_NER_MIN_CONFIDENCE = 0.75
+    # Suppress URL type entirely — email sub-parts are frequently mis-tagged as URLs.
+    SUPPRESSED_TYPES = {"URL"}
+    MIN_VALUE_LENGTH = 3
+
     PATTERN_SPECS = [
         {
             "entity_type": "EMAIL_ADDRESS",
@@ -90,6 +137,7 @@ class PresidioEngine:
     def _load_engine():
         try:
             from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer, RecognizerRegistry  # type: ignore
+            from presidio_analyzer.nlp_engine import NlpEngineProvider  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
                 "Presidio Analyzer is not installed. Install with: pip install presidio-analyzer"
@@ -99,7 +147,38 @@ class PresidioEngine:
         for recognizer in PresidioEngine._build_recognizers(PatternRecognizer, Pattern):
             registry.add_recognizer(recognizer)
 
-        return AnalyzerEngine(registry=registry)
+        # spaCy NER types that are not mapped to any Presidio entity type.
+        # Listing them in labels_to_ignore prevents Presidio from emitting
+        # "Entity X is not mapped to a Presidio entity" WARNING logs.
+        # NOTE: NlpEngineProvider internally does NerModelConfiguration(**config["ner_model_configuration"]),
+        # so this must be a plain dict — NOT a pre-built NerModelConfiguration object.
+        _ner_model_configuration = {
+            "labels_to_ignore": [
+                "CARDINAL", "ORDINAL", "QUANTITY", "MONEY", "PERCENT",
+                "LANGUAGE", "WORK_OF_ART", "LAW", "EVENT", "PRODUCT", "TIME",
+            ]
+        }
+
+        for model_name in ("en_core_web_sm", "en_core_web_lg"):
+            try:
+                nlp_engine = NlpEngineProvider(
+                    nlp_configuration={
+                        "nlp_engine_name": "spacy",
+                        "models": [{"lang_code": "en", "model_name": model_name}],
+                        "ner_model_configuration": _ner_model_configuration,
+                    }
+                ).create_engine()
+                return AnalyzerEngine(registry=registry, nlp_engine=nlp_engine)
+            except Exception as exc:
+                logger.warning("Presidio spaCy model %s unavailable: %s", model_name, exc)
+
+        try:
+            return AnalyzerEngine(registry=registry)
+        except Exception as exc:
+            raise RuntimeError(
+                "Presidio Analyzer could not start. Install a spaCy English model with: "
+                "python -m spacy download en_core_web_sm"
+            ) from exc
 
     @staticmethod
     def _build_recognizers(pattern_recognizer_cls, pattern_cls):
@@ -128,6 +207,19 @@ class PresidioEngine:
         merged.sort(key=lambda item: (item.get("start", 0), item.get("type", "")))
         return merged
 
+    def _should_keep(self, entity_type: str, score: float, value: str) -> bool:
+        """Return False for findings that are likely false positives."""
+        # Suppress entire entity types that are too noisy.
+        if entity_type in self.SUPPRESSED_TYPES:
+            return False
+        # Drop very short values (field-label fragments).
+        if len(value.strip()) < self.MIN_VALUE_LENGTH:
+            return False
+        # spaCy NER types require higher confidence to pass.
+        if entity_type in self.SPACY_NER_TYPES and score < self.SPACY_NER_MIN_CONFIDENCE:
+            return False
+        return True
+
     def detect(self, text: str) -> List[Dict]:
         if not text:
             return []
@@ -147,13 +239,18 @@ class PresidioEngine:
                 score = float(res.score or 0.0)
                 value = text[start:end]
 
+                if not self._should_keep(entity_type, score, value):
+                    continue
+
+                normalized_type = self.ENTITY_MAP.get(entity_type, entity_type)
+
                 findings.append(
                     {
-                        "type": entity_type,
+                        "type": normalized_type,
                         "label": entity_type,
                         "value": value,
                         "masked_value": value[:2] + "***" + (value[-2:] if len(value) > 2 else ""),
-                        "severity": "medium",
+                        "severity": self._severity_for(entity_type),
                         "start": start,
                         "end": end,
                         "line": text.count("\n", 0, start) + 1,
@@ -167,3 +264,11 @@ class PresidioEngine:
         merged = self._merge_results(findings)
         logger.info("Presidio detection found %s entities", len(merged))
         return merged
+
+    @classmethod
+    def _severity_for(cls, entity_type: str) -> str:
+        if entity_type in cls.HIGH_RISK_ENTITIES:
+            return "high"
+        if entity_type in cls.MEDIUM_RISK_ENTITIES:
+            return "medium"
+        return "low"

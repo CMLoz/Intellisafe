@@ -10,8 +10,12 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from app.backend.privacy_risk_manager import PrivacyRiskManager
+from app.backend.redaction_engine import RedactionEngine
+from app.backend.database import get_db
+
 # Load Torch before Qt to avoid a Windows DLL initialization conflict where
-# importing PyQt6 first can prevent torch\lib\c10.dll from initializing.
+# importing Qt first can prevent torch\lib\c10.dll from initializing.
 try:
     import torch  # noqa: F401
 except ImportError:
@@ -56,6 +60,12 @@ def setup_logging():
             logging.StreamHandler()
         ]
     )
+
+    # Suppress noisy third-party loggers that produce expected/benign warnings.
+    # huggingface_hub emits unauthenticated-request warnings even when models
+    # are already cached locally; these are irrelevant for end users.
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+    logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
 
 # ============================================================================
 # STYLES
@@ -199,46 +209,48 @@ class FileHandler:
     
     SUPPORTED_FORMATS = {'.pdf', '.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.docx', '.sql', '.txt'}
     MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
-    
+    LARGE_FILE_WARNING = 10 * 1024 * 1024  # 10 MB warning threshold
+
     @staticmethod
     def validate_file(file_path: Path) -> tuple:
-        """Validate file format and size"""
         if not file_path.exists():
             return False, "File does not exist"
-        
+
         if file_path.suffix.lower() not in FileHandler.SUPPORTED_FORMATS:
             return False, f"Unsupported format: {file_path.suffix}"
-        
+
         if file_path.stat().st_size > FileHandler.MAX_FILE_SIZE:
             size_mb = FileHandler.MAX_FILE_SIZE / 1024 / 1024
             return False, f"File exceeds maximum size of {size_mb:.0f} MB"
-        
+
         return True, "Valid"
-    
+
     @staticmethod
     def get_file_info(file_path: Path) -> dict:
-        """Get file information"""
         stat = file_path.stat()
+        size_bytes = stat.st_size
+        warning = size_bytes > FileHandler.LARGE_FILE_WARNING
         return {
             'name': file_path.name,
             'path': str(file_path),
-            'size': stat.st_size,
+            'size': size_bytes,
             'format': file_path.suffix.lower(),
             'created': stat.st_ctime,
             'modified': stat.st_mtime,
+            'size_warning': warning,
         }
 
 # ============================================================================
-# PYQT6 IMPORTS AND COMPONENTS
+# PYSIDE6 IMPORTS AND COMPONENTS
 # ============================================================================
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QLabel, QFrame, QFileDialog, QListWidget, QListWidgetItem, QScrollArea,
     QTextEdit, QCheckBox, QComboBox, QSizePolicy, QDialog
 )
-from PyQt6.QtCore import Qt, QSize, QMimeData, QTimer, pyqtSignal, QObject, QThread
-from PyQt6.QtGui import QIcon, QFont, QDrag, QColor, QDropEvent, QPixmap
+from PySide6.QtCore import Qt, QSize, QMimeData, QTimer, Signal, QObject, QThread
+from PySide6.QtGui import QIcon, QFont, QDrag, QColor, QDropEvent, QPixmap
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +261,7 @@ logger = logging.getLogger(__name__)
 class UploadDropZone(QFrame):
     """Drag and drop zone for file uploads"""
     
-    files_dropped = pyqtSignal(list)  # Signal when files are dropped
+    files_dropped = Signal(list)  # Signal when files are dropped
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -340,47 +352,52 @@ class UploadDropZone(QFrame):
 
 class FileListWidget(QWidget):
     """Widget to display uploaded files"""
-    
+
     def __init__(self, files=None, parent=None):
         super().__init__(parent)
         self.files = files if files is not None else []
+        self._validation_pipeline = None
         self.init_ui()
         self.refresh_list()
-    
+
     def init_ui(self):
         layout = QVBoxLayout(self)
-        
-        # Title
+
         title = QLabel("Uploaded Files")
         title.setObjectName("title")
         layout.addWidget(title)
-        
-        # File list
+
         self.list_widget = QListWidget()
         self.list_widget.setMaximumHeight(300)
         layout.addWidget(self.list_widget)
-        
-        # Clear button
+
         clear_btn = QPushButton("Clear All")
         clear_btn.clicked.connect(self.clear_files)
         layout.addWidget(clear_btn)
-        
+
         layout.addStretch()
+
+    def _get_validation_pipeline(self):
+        if self._validation_pipeline is None:
+            try:
+                from app.backend.detection import ValidationPipeline
+                self._validation_pipeline = ValidationPipeline()
+            except ImportError:
+                pass
+        return self._validation_pipeline
     
     def add_files(self, files: list):
         """Add files to the list and parse them"""
         # Import parser
         try:
             from app.backend.file_parser import FileParser
-            from app.backend.detection import ValidationPipeline
         except ImportError:
-            logger.error("Could not import FileParser or ValidationPipeline")
+            logger.error("Could not import FileParser")
             return
 
         host = self.window()
-        
+
         for file_path in files:
-            # Validate file
             valid, msg = FileHandler.validate_file(file_path)
             if not valid:
                 logger.warning(f"Invalid file {file_path}: {msg}")
@@ -391,42 +408,45 @@ class FileListWidget(QWidget):
 
             if is_image and host is not None and hasattr(host, "perform_image_ocr"):
                 logger.info("Routing image upload through OCR flow: %s", file_path.name)
-                ocr_info = host.perform_image_ocr(file_path)
-                if ocr_info is None:
+                ocr_pending = host.perform_image_ocr(file_path)
+                if ocr_pending is None:
                     logger.info("OCR canceled for %s", file_path.name)
                     continue
-
                 self.refresh_list()
-                logger.info(f"File added to list: {ocr_info['name']}")
                 continue
-            
+
             info = FileHandler.get_file_info(file_path)
             self.files.append(info)
-            
-            # Parse the file
+
             logger.info(f"Parsing file: {file_path.name}")
             parse_result = FileParser.parse(file_path)
-            
+
             if parse_result['status'] == 'success':
-                # Store parsed content in file info
                 info['parsed_content'] = parse_result['content']
                 info['parsed_metadata'] = parse_result['metadata']
-                validator = ValidationPipeline()
-                validation = validator.run(parse_result['content'], mode="standard")
-                info['findings'] = validation['findings']
-                info['findings_summary'] = validation['summary']
-                info['validation_tier'] = validation['validation_tier']
-                info['confidence_breakdown'] = validation['confidence_breakdown']
-                info['regex_findings'] = validation['findings']
-                info['regex_summary'] = validation['summary']
+                validator = self._get_validation_pipeline()
+                if validator:
+                    validation = validator.run(parse_result['content'], mode="standard")
+                    info['findings'] = validation['findings']
+                    info['findings_summary'] = validation['summary']
+                    info['validation_tier'] = validation['validation_tier']
+                    info['confidence_breakdown'] = validation['confidence_breakdown']
+                    info['regex_findings'] = validation['findings']
+                    info['regex_summary'] = validation['summary']
+                else:
+                    info['findings'] = []
+                    info['findings_summary'] = {}
+                    info['validation_tier'] = "standard"
+                    info['confidence_breakdown'] = {}
+                    info['regex_findings'] = []
+                    info['regex_summary'] = {}
                 logger.info(f"Successfully parsed: {file_path.name}")
             else:
-                # Add error indicator
                 logger.error(f"Failed to parse {file_path.name}: {parse_result.get('error', 'Unknown error')}")
                 info['parse_error'] = parse_result.get('error', 'Unknown error')
-            
+
             self.add_file_item(info)
-            
+
             logger.info(f"File added to list: {info['name']}")
 
     def refresh_list(self):
@@ -436,15 +456,19 @@ class FileListWidget(QWidget):
             self.add_file_item(info)
 
     def add_file_item(self, info: dict):
-        """Add one uploaded file row to the list widget."""
         size_mb = info['size'] / 1024 / 1024
+        warning = ""
+        if info.get('size_warning'):
+            warning = " ⚠"
         if 'parse_error' in info:
-            item_text = f"✗ {info['name']} ({size_mb:.2f} MB) - Parse Error"
+            item_text = f"✗ {info['name']} ({size_mb:.2f} MB){warning} - Parse Error"
         elif 'parsed_content' in info:
             finding_count = len(info.get('findings', info.get('regex_findings', [])))
-            item_text = f"✓ {info['name']} ({size_mb:.2f} MB) - {finding_count} findings"
+            item_text = f"✓ {info['name']} ({size_mb:.2f} MB){warning} - {finding_count} findings"
+        elif info.get('processing_status'):
+            item_text = f"{info['name']} ({size_mb:.2f} MB){warning} - {info['processing_status']}"
         else:
-            item_text = f"{info['name']} ({size_mb:.2f} MB) - {info['format']}"
+            item_text = f"{info['name']} ({size_mb:.2f} MB){warning} - {info['format']}"
 
         item = QListWidgetItem(item_text)
         self.list_widget.addItem(item)
@@ -467,6 +491,7 @@ class ImageOCRPromptDialog(QDialog):
         self.selected_steps: list[str] = []
         self.selected_language = "eng"
         self.selected_scan_mode = "standard"
+        self.skip_preprocessing = False
         self._build_ui()
 
     def _build_ui(self):
@@ -476,6 +501,13 @@ class ImageOCRPromptDialog(QDialog):
         title = QLabel(f"OCR preprocessing for {self.file_path.name}")
         title.setObjectName("title")
         layout.addWidget(title)
+
+        file_size_mb = self.file_path.stat().st_size / 1024 / 1024
+        if file_size_mb > 10:
+            warning = QLabel(f"⚠ Large file ({file_size_mb:.1f} MB). Consider skipping preprocessing for faster processing.")
+            warning.setStyleSheet("color: #fbbf24; font-size: 11px;")
+            warning.setWordWrap(True)
+            layout.addWidget(warning)
 
         subtitle = QLabel("Choose image preprocessing before IntelliSafe extracts text and runs detection.")
         subtitle.setObjectName("subtitle")
@@ -531,6 +563,11 @@ class ImageOCRPromptDialog(QDialog):
         steps_layout.addStretch()
         layout.addLayout(steps_layout)
 
+        self.skip_checkbox = QCheckBox("Skip preprocessing (fastest)")
+        self.skip_checkbox.setStyleSheet("color: #fbbf24;")
+        self.skip_checkbox.toggled.connect(self._on_skip_toggled)
+        layout.addWidget(self.skip_checkbox)
+
         actions = QHBoxLayout()
         actions.addStretch()
         cancel_btn = QPushButton("Cancel")
@@ -541,10 +578,17 @@ class ImageOCRPromptDialog(QDialog):
         actions.addWidget(process_btn)
         layout.addLayout(actions)
 
+    def _on_skip_toggled(self, checked: bool):
+        for checkbox in self.step_checkboxes.values():
+            checkbox.setEnabled(not checked)
+
     def get_settings(self) -> dict:
-        steps = [step for step, checkbox in self.step_checkboxes.items() if checkbox.isChecked()]
-        if not steps:
-            steps = ["grayscale"]
+        if self.skip_checkbox.isChecked():
+            steps = []
+        else:
+            steps = [step for step, checkbox in self.step_checkboxes.items() if checkbox.isChecked()]
+            if not steps:
+                steps = ["grayscale"]
         return {
             "selected_steps": steps,
             "language": self.language_combo.currentText(),
@@ -555,39 +599,60 @@ class ImageOCRPromptDialog(QDialog):
 # MAIN WINDOW
 # ============================================================================
 
+class _OcrWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, file_path, settings, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.settings = settings
+
+    def run(self):
+        try:
+            from app.backend.ocr_processor import OCRPipeline
+            from app.backend.detection import ValidationPipeline
+            pipeline = OCRPipeline(language=self.settings['language'])
+            result = pipeline.process(str(self.file_path), self.settings['selected_steps'])
+            validation = ValidationPipeline().run(result.get('text', ''), mode=self.settings['scan_mode'])
+            self.finished.emit({'ocr': result, 'validation': validation})
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     """Main application window"""
-    
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("IntelliSafe - Sensitive Data Detection")
         self.setGeometry(100, 100, 1400, 900)
         self.setStyleSheet(STYLESHEET)
+        self._active_ocr_threads: list[QThread] = []
+        self._active_ocr_workers: list[_OcrWorker] = []
         self.current_page = "upload"
         self.uploaded_files = []
         self.findings_file_list = None
         self.findings_findings_output = None
         self.findings_text_output = None
-        
-        # Create central widget
+        self._validation_pipeline = None
+        self._pipeline_ready = False
+        self._risk_manager = PrivacyRiskManager()
+        self._redaction_engine = RedactionEngine()
+
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
-        # Main layout
         main_layout = QHBoxLayout(central_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        
-        # Add sidebar
+
         self.sidebar = self.create_sidebar()
         main_layout.addWidget(self.sidebar)
-        
-        # Add content area
         self.content_area = QWidget()
         self.content_layout = QVBoxLayout(self.content_area)
         main_layout.addWidget(self.content_area, 1)
-        
-        # Show initial page
+
+        self._start_background_init()
         self.switch_page("upload")
     
     def create_sidebar(self) -> QFrame:
@@ -615,6 +680,8 @@ class MainWindow(QMainWindow):
             ("🛡️ Protection", "protection"),
             ("⚙️ Detection", "detection"),
             ("🔎 Findings", "findings"),
+            ("🛡️ Risk Assessment", "risk"),
+            ("🔎 Redaction", "redact"),
             ("📋 Reports", "reports"),
         ]
         
@@ -659,6 +726,10 @@ class MainWindow(QMainWindow):
             self.show_detection_page()
         elif page_id == "findings":
             self.show_findings_page()
+        elif page_id == "risk":
+            self.show_risk_dashboard()
+        elif page_id == "redact":
+            self.show_redact_page()
         elif page_id == "reports":
             self.show_reports_page()
 
@@ -671,7 +742,25 @@ class MainWindow(QMainWindow):
             elif child.layout():
                 self.clear_layout(child.layout())
                 child.layout().deleteLater()
-    
+
+    def _start_background_init(self):
+        """Initialize heavy components in background thread."""
+        from threading import Thread
+        def init_models():
+            try:
+                from app.backend.detection import ValidationPipeline
+                self._validation_pipeline = ValidationPipeline()
+                self._pipeline_ready = True
+                logger.info("Background model initialization complete")
+            except Exception as e:
+                logger.warning(f"Background initialization failed: {e}")
+
+        thread = Thread(target=init_models, daemon=True)
+        thread.start()
+
+    def _get_validation_pipeline(self):
+        return self._validation_pipeline
+
     def show_upload_page(self):
         """Display upload page"""
         layout = self.content_layout
@@ -824,10 +913,18 @@ class MainWindow(QMainWindow):
                 if findings:
                     finding_lines = []
                     for index, finding in enumerate(findings, start=1):
+                        confidence = finding.get('consensus_score', finding.get('highest_confidence', finding.get('confidence')))
+                        confidence_parts = []
+                        if isinstance(confidence, (int, float)):
+                            confidence_parts.append(f"confidence {confidence * 100:.1f}%" if confidence <= 1.0 else f"confidence {confidence:.1f}%")
+                        transformer_conf = finding.get('transformer_confidence')
+                        if isinstance(transformer_conf, (int, float)):
+                            confidence_parts.append(f"transformer {transformer_conf * 100:.1f}%" if transformer_conf <= 1.0 else f"transformer {transformer_conf:.1f}%")
+                        confidence_str = f" [{', '.join(confidence_parts)}]" if confidence_parts else ""
                         finding_lines.append(
-                            f"{index}. {finding['type']} ({finding['severity']}) "
-                            f"line {finding['line']}: {finding['masked_value']}\n"
-                            f"   Context: {finding['context']}"
+                            f"{index}. {finding.get('type', finding['type'])} ({finding.get('severity', finding['severity'])}) "
+                            f"line {finding.get('line', finding['line'])}: {finding.get('masked_value', finding.get('value', ''))}{confidence_str}\n"
+                            f"   Context: {finding.get('context', finding['context'])}"
                         )
                     findings_text = "\n\nRegex Findings:\n" + "\n".join(finding_lines) + "\n"
                 else:
@@ -1006,73 +1103,140 @@ class MainWindow(QMainWindow):
         if settings is None:
             return None
 
-        try:
-            from app.backend.ocr_processor import OCRPipeline
-            from app.backend.detection import ValidationPipeline
-        except ImportError as exc:
-            logger.error("Could not import OCRPipeline or ValidationPipeline: %s", exc)
+        worker = _OcrWorker(file_path, settings)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        result_holder = {}
+        _OCR_PENDING = object()
+        pending_info = FileHandler.get_file_info(file_path)
+        pending_info['processing_status'] = 'OCR in progress'
+        self._upsert_uploaded_file(pending_info)
+        self.refresh_upload_file_list()
+        self.refresh_findings_page()
+
+        def _on_finished(payload):
+            result_holder['success'] = payload
+            thread.quit()
+
+        def _on_failed(err: str):
+            result_holder['error'] = err
+            thread.quit()
+
+        self._active_ocr_threads.append(thread)
+        self._active_ocr_workers.append(worker)
+        worker.finished.connect(_on_finished)
+        worker.failed.connect(_on_failed)
+        thread.started.connect(worker.run)
+        thread.finished.connect(lambda: self._finalize_ocr(file_path, result_holder, settings))
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(lambda: self._forget_ocr_job(thread, worker))
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        return _OCR_PENDING
+
+    def _forget_ocr_job(self, thread: QThread, worker: _OcrWorker):
+        if thread in self._active_ocr_threads:
+            self._active_ocr_threads.remove(thread)
+        if worker in self._active_ocr_workers:
+            self._active_ocr_workers.remove(worker)
+
+    def _finalize_ocr(self, file_path: Path, result_holder: dict, settings: dict):
+        if not self.isVisible():
+            return
+        if 'error' in result_holder:
+            logger.error("OCR failed for %s: %s", file_path.name, result_holder['error'])
             file_info = FileHandler.get_file_info(file_path)
-            file_info['parse_error'] = str(exc)
-            self.uploaded_files.append(file_info)
-            return file_info
-
-        try:
-            if not hasattr(self, "validation_pipeline"):
-                self.validation_pipeline = ValidationPipeline()
-
-            logger.info("Running OCR for image: %s", file_path.name)
-            pipeline = OCRPipeline(language=settings['language'])
-            result = pipeline.process(str(file_path), settings['selected_steps'])
-            validation = self.validation_pipeline.run(result.get('text', ''), mode=settings['scan_mode'])
-            findings = validation['findings']
-
-            ocr_record = {
-                'file_path': str(file_path),
-                'file_name': file_path.name,
-                'text': result.get('text', ''),
-                'confidence': result.get('confidence', 0),
-                'word_count': result.get('word_count', 0),
-                'engine': result.get('engine', 'paddleocr'),
-                'fallback_used': result.get('fallback_used', False),
-                'preprocessing_steps': result.get('preprocessing_steps_used', settings['selected_steps']),
-                'language': settings['language'],
-                'scan_mode': settings['scan_mode'],
-                'validation_tier': validation['validation_tier'],
-                'confidence_breakdown': validation['confidence_breakdown'],
-                'findings': findings,
-                'findings_summary': validation['summary'],
-                'regex_findings': findings,
-                'regex_summary': validation['summary'],
-            }
-
-            file_info = self.store_ocr_result_as_uploaded_file(ocr_record)
+            file_info['parse_error'] = result_holder['error']
+            self._upsert_uploaded_file(file_info)
+            self.refresh_upload_file_list()
             self.refresh_findings_page()
-            logger.info(
-                "OCR completed for %s: %s words, %s findings",
-                file_path.name,
-                ocr_record['word_count'],
-                len(findings),
-            )
-            return file_info
-        except Exception as exc:
-            logger.error("OCR failed for %s: %s", file_path.name, exc)
+            return
+        if 'success' not in result_holder:
+            logger.error("OCR failed for %s: worker finished without a result", file_path.name)
             file_info = FileHandler.get_file_info(file_path)
-            file_info['parse_error'] = str(exc)
+            file_info['parse_error'] = "OCR worker finished without a result"
+            self._upsert_uploaded_file(file_info)
+            self.refresh_upload_file_list()
+            self.refresh_findings_page()
+            return
+        payload = result_holder['success']
+        result = payload['ocr']
+        validation = payload['validation']
+        findings = validation['findings']
+
+        ocr_record = {
+            'file_path': str(file_path),
+            'file_name': file_path.name,
+            'text': result.get('text', ''),
+            'confidence': result.get('confidence', 0),
+            'word_count': result.get('word_count', 0),
+            'engine': result.get('engine', 'paddleocr'),
+            'fallback_used': result.get('fallback_used', False),
+            'preprocessing_steps': result.get('preprocessing_steps_used', settings['selected_steps']),
+            'language': settings['language'],
+            'scan_mode': settings['scan_mode'],
+            'validation_tier': validation['validation_tier'],
+            'confidence_breakdown': validation['confidence_breakdown'],
+            'findings': findings,
+            'findings_summary': validation['summary'],
+            'regex_findings': findings,
+            'regex_summary': validation['summary'],
+        }
+
+        file_info = self.store_ocr_result_as_uploaded_file(ocr_record)
+        self.refresh_upload_file_list()
+        self.refresh_findings_page()
+        logger.info(
+            "OCR completed for %s: %s words, %s findings",
+            file_path.name,
+            ocr_record['word_count'],
+            len(findings),
+        )
+        return file_info
+
+    def _upsert_uploaded_file(self, file_info: dict):
+        existing_index = next(
+            (
+                index
+                for index, uploaded in enumerate(self.uploaded_files)
+                if uploaded.get('path') == file_info.get('path')
+            ),
+            None
+        )
+        if existing_index is None:
             self.uploaded_files.append(file_info)
-            return file_info
+        else:
+            self.uploaded_files[existing_index] = file_info
+
+    def refresh_upload_file_list(self):
+        file_list = getattr(self, "file_list", None)
+        if file_list is None:
+            return
+        try:
+            file_list.refresh_list()
+        except RuntimeError:
+            self.file_list = None
 
     def refresh_findings_page(self):
         """Refresh the Findings page list and displayed details."""
         if self.findings_file_list is None:
             return
 
-        self.findings_file_list.clear()
+        try:
+            self.findings_file_list.clear()
+        except RuntimeError:
+            self.findings_file_list = None
+            self.findings_findings_output = None
+            self.findings_text_output = None
+            return
         for index, file_info in enumerate(self.uploaded_files):
             if 'parse_error' in file_info:
                 item_text = f"{file_info['name']} - Parse Error"
             elif 'parsed_content' in file_info:
                 finding_count = len(file_info.get('regex_findings', []))
                 item_text = f"{file_info['name']} - {finding_count} findings"
+            elif file_info.get('processing_status'):
+                item_text = f"{file_info['name']} - {file_info['processing_status']}"
             else:
                 item_text = f"{file_info['name']} - Pending"
 
@@ -1169,12 +1333,29 @@ class MainWindow(QMainWindow):
         findings = file_info.get('regex_findings', [])
         metadata = file_info.get('parsed_metadata', {})
 
+        MAX_FINDINGS_PREVIEW = 100
+        total_findings = len(findings)
+        if total_findings > MAX_FINDINGS_PREVIEW:
+            findings_to_show = findings[:MAX_FINDINGS_PREVIEW]
+            truncated_msg = f"\n\n... and {total_findings - MAX_FINDINGS_PREVIEW} more findings (showing first {MAX_FINDINGS_PREVIEW})"
+        else:
+            findings_to_show = findings
+            truncated_msg = ""
+
         findings_lines = []
-        if findings:
-            for index, finding in enumerate(findings, start=1):
+        if findings_to_show:
+            for index, finding in enumerate(findings_to_show, start=1):
+                confidence = finding.get('consensus_score', finding.get('highest_confidence', finding.get('confidence')))
+                confidence_parts = []
+                if isinstance(confidence, (int, float)):
+                    confidence_parts.append(f"confidence {confidence * 100:.1f}%" if confidence <= 1.0 else f"confidence {confidence:.1f}%")
+                transformer_conf = finding.get('transformer_confidence')
+                if isinstance(transformer_conf, (int, float)):
+                    confidence_parts.append(f"transformer {transformer_conf * 100:.1f}%" if transformer_conf <= 1.0 else f"transformer {transformer_conf:.1f}%")
+                confidence_str = f" [{', '.join(confidence_parts)}]" if confidence_parts else ""
                 findings_lines.append(
                     f"{index}. {finding.get('type', 'Unknown')} ({finding.get('severity', 'medium')}) "
-                    f"line {finding.get('line', '?')}: {finding.get('masked_value', finding.get('value', ''))}\n"
+                    f"line {finding.get('line', '?')}: {finding.get('masked_value', finding.get('value', ''))}{confidence_str}\n"
                     f"   Context: {finding.get('context', '')}"
                 )
         else:
@@ -1187,8 +1368,10 @@ class MainWindow(QMainWindow):
         ]
 
         findings_text = "\n\n".join([
-            "Findings:\n" + "\n".join(findings_lines),
-            "Metadata:\n" + ("\n".join(metadata_lines) if metadata_lines else "No metadata available."),
+            "Findings:",
+            "\n".join(findings_lines) + truncated_msg,
+            "Metadata:",
+            "\n".join(metadata_lines) if metadata_lines else "No metadata available.",
         ])
 
         self.findings_findings_output.setPlainText(findings_text)
@@ -1217,20 +1400,208 @@ class MainWindow(QMainWindow):
         file_info['regex_findings'] = file_info['findings']
         file_info['regex_summary'] = file_info['findings_summary']
 
-        existing_index = next(
-            (
-                index
-                for index, uploaded in enumerate(self.uploaded_files)
-                if uploaded.get('path') == file_info['path']
-            ),
-            None
-        )
-        if existing_index is None:
-            self.uploaded_files.append(file_info)
-        else:
-            self.uploaded_files[existing_index] = file_info
+        assessment = self._risk_manager.assess(file_info.get('findings', []))
+        file_info['risk_assessment'] = assessment
+
+        db = get_db()
+        try:
+            file_id = db.add_file(
+                filename=file_info['name'],
+                file_path=file_info['path'],
+                file_size=file_info['size'],
+                file_format=file_info['format'],
+                status="success" if 'parse_error' not in file_info else "error",
+                error_message=file_info.get('parse_error'),
+            )
+            if file_id:
+                for finding in file_info.get('findings', []):
+                    db.add_detection(
+                        file_id=file_id,
+                        detection_type=finding.get('engine', 'unknown'),
+                        pattern_matched=finding.get('type', ''),
+                        data_found=finding.get('masked_value', ''),
+                        location_info=f"line {finding.get('line', '?')}",
+                        risk_level=finding.get('severity', finding.get('risk_level', 'medium')),
+                    )
+                db.update_file_risk_metadata(
+                    file_id=file_id,
+                    risk_score=assessment['risk_score'],
+                    risk_level=assessment['risk_level'],
+                    findings_count=assessment['total_findings'],
+                    entity_counts=assessment['findings_by_type'],
+                )
+        except Exception as exc:
+            logger.warning("DB persistence skipped: %s", exc)
+
+        self._upsert_uploaded_file(file_info)
         return file_info
-    
+
+    def show_risk_dashboard(self):
+        layout = self.content_layout
+        layout.setContentsMargins(40, 40, 40, 40)
+
+        title = QLabel("Privacy Risk Dashboard")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        subtitle = QLabel("Risk scores, entity breakdown, and redaction coverage")
+        subtitle.setObjectName("subtitle")
+        layout.addWidget(subtitle)
+        layout.addSpacing(24)
+
+        analytics = {}
+        try:
+            analytics = get_db().get_risk_analytics()
+        except Exception as exc:
+            logger.warning("Risk analytics unavailable: %s", exc)
+
+        risk_dist = analytics.get("risk_distribution", {})
+        high_count = risk_dist.get("high", 0)
+        medium_count = risk_dist.get("medium", 0)
+        redacted_count = analytics.get("total_redacted_documents", 0)
+
+        stats_layout = QHBoxLayout()
+        for label_text, value, icon in [
+            ("High-Risk Docs", str(high_count), "🔴"),
+            ("Medium-Risk Docs", str(medium_count), "🟡"),
+            ("Redacted Docs", str(redacted_count), "🛡️"),
+        ]:
+            card = QFrame()
+            card.setObjectName("card")
+            cl = QVBoxLayout(card)
+            cl.addWidget(QLabel(label_text))
+            val_label = QLabel(value)
+            val_label.setObjectName("stat-value")
+            cl.addWidget(val_label)
+            stats_layout.addWidget(card)
+        layout.addLayout(stats_layout)
+        layout.addSpacing(24)
+
+        top_title = QLabel("Top Detected Entity Types")
+        top_title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        layout.addWidget(top_title)
+
+        top_entities = analytics.get("top_entity_types", {})
+        if top_entities:
+            for entity, count in list(top_entities.items())[:8]:
+                row = QHBoxLayout()
+                row.addWidget(QLabel(entity))
+                row.addStretch()
+                row.addWidget(QLabel(f"{count} occurrences"))
+                layout.addLayout(row)
+        else:
+            layout.addWidget(QLabel("No entity data available yet."))
+
+        layout.addStretch()
+
+    def show_redact_page(self):
+        layout = self.content_layout
+        layout.setContentsMargins(40, 40, 40, 40)
+
+        title = QLabel("Redaction Studio")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        subtitle = QLabel("Generate redacted copies sensitive data")
+        subtitle.setObjectName("subtitle")
+        layout.addWidget(subtitle)
+        layout.addSpacing(20)
+
+        if not self.uploaded_files:
+            layout.addWidget(QLabel("No files uploaded. Upload files first."))
+            layout.addStretch()
+            return
+
+        file_list = QListWidget()
+        file_list.setMinimumWidth(320)
+        for fi in self.uploaded_files:
+            risk = fi.get('risk_assessment', {}).get('risk_level', 'unknown')
+            file_list.addItem(f"{fi['name']} [{risk.upper()}]")
+        layout.addWidget(file_list)
+
+        strat_layout = QHBoxLayout()
+        strat_layout.addWidget(QLabel("Strategy:"))
+        strategy_combo = QComboBox()
+        strategy_combo.addItems(["blackout", "pixelate", "blur"])
+        strat_layout.addWidget(strategy_combo)
+        strat_layout.addSpacing(16)
+        strat_layout.addWidget(QLabel("Mode:"))
+        mode_combo = QComboBox()
+        mode_combo.addItems(["auto", "full", "partial"])
+        strat_layout.addWidget(mode_combo)
+        layout.addLayout(strat_layout)
+
+        output = QTextEdit()
+        output.setReadOnly(True)
+        output.setPlaceholderText("Redaction output will appear here...")
+        layout.addWidget(output, 1)
+
+        def run_redaction():
+            idx = file_list.currentRow()
+            if idx < 0 or idx >= len(self.uploaded_files):
+                output.setText("Select a file first.")
+                return
+            fi = self.uploaded_files[idx]
+            findings = fi.get('findings', [])
+            if not findings:
+                output.setText("No findings to redact for this file.")
+                return
+
+            strategy = strategy_combo.currentText()
+            mode = mode_combo.currentText()
+            fmt = fi.get('format', '').lower()
+            path = fi.get('path', '')
+            try:
+                if fmt in {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}:
+                    result = self._redaction_engine.redact_image(path, findings, strategy)
+                elif fmt == '.pdf':
+                    result = self._redaction_engine.redact_pdf(path, findings, strategy)
+                elif fmt in {'.txt', '.sql'}:
+                    result = self._redaction_engine.redact_text_file(path, findings)
+                else:
+                    output.setText("Redaction for this file type is not yet supported.")
+                    return
+
+                db = get_db()
+                try:
+                    row = db.connect().execute(
+                        "SELECT id FROM files WHERE file_path = ?", (fi['path'],)
+                    ).fetchone()
+                    if row:
+                        db.add_redaction(
+                            file_id=row[0],
+                            redaction_type="full_run",
+                            mode=mode,
+                            strategy=strategy,
+                            output_path=result.get('output_path'),
+                            findings_redacted=result.get('findings_redacted', len(findings)),
+                        )
+                        db.update_file_risk_metadata(
+                            file_id=row[0],
+                            risk_score=fi.get('risk_assessment', {}).get('risk_score', 0),
+                            risk_level=fi.get('risk_assessment', {}).get('risk_level', 'low'),
+                            redacted_path=result.get('output_path'),
+                            redaction_strategy=strategy,
+                        )
+                except Exception as db_exc:
+                    logger.warning("Redaction DB logging failed: %s", db_exc)
+
+                output.setText(
+                    f"Redaction complete.\n"
+                    f"Output: {result.get('output_path')}\n"
+                    f"Findings redacted: {result.get('findings_redacted', len(findings))}\n"
+                    f"Strategy: {strategy} / Mode: {mode}"
+                )
+            except Exception as exc:
+                output.setText(f"Redaction failed: {exc}")
+
+        btn_layout = QHBoxLayout()
+        redact_btn = QPushButton("Generate Redacted Copy")
+        redact_btn.clicked.connect(run_redaction)
+        btn_layout.addWidget(redact_btn)
+        layout.addLayout(btn_layout)
+        layout.addStretch()
+
     def show_reports_page(self):
         """Display reports page"""
         layout = self.content_layout

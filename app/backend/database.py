@@ -107,10 +107,36 @@ class DatabaseManager:
 
             self._ensure_column(cursor, "ocr_results", "validation_tier", "TEXT")
             self._ensure_column(cursor, "ocr_results", "confidence_breakdown", "TEXT")
-            
+
+            # Risk-assessment columns for files table
+            self._ensure_column(cursor, "files", "risk_score", "REAL DEFAULT 0")
+            self._ensure_column(cursor, "files", "risk_level", "TEXT DEFAULT 'low'")
+            self._ensure_column(cursor, "files", "document_classification", "TEXT DEFAULT 'unclassified'")
+            self._ensure_column(cursor, "files", "redacted_version_path", "TEXT")
+            self._ensure_column(cursor, "files", "redaction_strategy", "TEXT DEFAULT 'blackout'")
+            self._ensure_column(cursor, "files", "total_findings_count", "INTEGER DEFAULT 0")
+            self._ensure_column(cursor, "files", "entity_type_counts", "TEXT DEFAULT '{}'")
+
+            # Redactions log table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS redactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_id INTEGER NOT NULL,
+                    redaction_type TEXT NOT NULL,
+                    entity_type TEXT,
+                    mode TEXT DEFAULT 'full',
+                    strategy TEXT DEFAULT 'blackout',
+                    output_path TEXT,
+                    findings_redacted INTEGER DEFAULT 0,
+                    redaction_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+                )
+            ''')
+
             # Create indexes for faster queries
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_date ON files(upload_date)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_format ON files(file_format)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_risk_level ON files(risk_level)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_detections_file ON detections(file_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_detections_type ON detections(detection_type)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_detections_risk ON detections(risk_level)')
@@ -118,6 +144,7 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(log_timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_ocr_file ON ocr_results(file_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_ocr_confidence ON ocr_results(confidence)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_redactions_file ON redactions(file_id)')
             
             conn.commit()
             logger.info(f"Database initialized: {self.db_path}")
@@ -172,8 +199,8 @@ class DatabaseManager:
             file_id = cursor.lastrowid
             logger.info(f"File added to database: {filename} (ID: {file_id})")
             return file_id
-        except sqlite3.IntegrityError as e:
-            logger.warning(f"File already exists in database: {file_path}")
+        except sqlite3.IntegrityError:
+            logger.debug("File already exists in database: %s — returning existing record ID.", file_path)
             # Return existing file ID
             cursor.execute('SELECT id FROM files WHERE file_path = ?', (file_path,))
             result = cursor.fetchone()
@@ -602,6 +629,124 @@ class DatabaseManager:
             return {}
     
     # ========================================================================
+    # REDACTION TABLE OPERATIONS
+    # ========================================================================
+
+    def add_redaction(
+        self,
+        file_id: int,
+        redaction_type: str,
+        entity_type: str | None = None,
+        mode: str = "full",
+        strategy: str = "blackout",
+        output_path: str | None = None,
+        findings_redacted: int = 0,
+    ) -> int:
+        """Log a redaction operation."""
+        conn = self.connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO redactions
+                (file_id, redaction_type, entity_type, mode, strategy, output_path, findings_redacted)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (file_id, redaction_type, entity_type, mode, strategy, output_path, findings_redacted))
+            conn.commit()
+            return cursor.lastrowid
+        except sqlite3.Error as e:
+            logger.error(f"Error logging redaction: {e}")
+            raise
+
+    def get_redactions_for_file(self, file_id: int) -> List[Dict]:
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM redactions
+            WHERE file_id = ?
+            ORDER BY redaction_timestamp DESC
+        ''', (file_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def update_file_risk_metadata(
+        self,
+        file_id: int,
+        risk_score: float,
+        risk_level: str,
+        classification: str = "unclassified",
+        redacted_path: str | None = None,
+        redaction_strategy: str | None = None,
+        findings_count: int | None = None,
+        entity_counts: Dict[str, int] | None = None,
+    ) -> bool:
+        """Update risk and redaction metadata for a file."""
+        conn = self.connect()
+        cursor = conn.cursor()
+        try:
+            sets = ["risk_score = ?", "risk_level = ?", "document_classification = ?"]
+            params: list = [risk_score, risk_level, classification]
+            if redacted_path:
+                sets.append("redacted_version_path = ?")
+                params.append(redacted_path)
+            if redaction_strategy:
+                sets.append("redaction_strategy = ?")
+                params.append(redaction_strategy)
+            if findings_count is not None:
+                sets.append("total_findings_count = ?")
+                params.append(findings_count)
+            if entity_counts is not None:
+                import json
+                sets.append("entity_type_counts = ?")
+                params.append(json.dumps(entity_counts))
+            params.append(file_id)
+            cursor.execute(f"UPDATE files SET {', '.join(sets)} WHERE id = ?", params)
+            conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.error(f"Error updating file risk metadata: {e}")
+            return False
+
+    def get_risk_analytics(self) -> Dict:
+        """Get risk-level distribution and top entity types across all files."""
+        conn = self.connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                SELECT risk_level, COUNT(*) as count
+                FROM files
+                WHERE risk_level IS NOT NULL AND risk_level != 'low'
+                GROUP BY risk_level
+            ''')
+            risk_dist = {row[0]: row[1] for row in cursor.fetchall()}
+
+            cursor.execute('''
+                SELECT entity_type_counts FROM files
+                WHERE entity_type_counts IS NOT NULL AND entity_type_counts != '{}'
+            ''')
+            entity_agg: Dict[str, int] = {}
+            import json
+            for row in cursor.fetchall():
+                counts = json.loads(row[0])
+                for k, v in counts.items():
+                    entity_agg[k] = entity_agg.get(k, 0) + int(v)
+
+            top_entities = sorted(entity_agg.items(), key=lambda kv: kv[1], reverse=True)[:10]
+
+            cursor.execute('''
+                SELECT COUNT(*) FROM files
+                WHERE redacted_version_path IS NOT NULL AND redacted_version_path != ''
+            ''')
+            redacted_count = cursor.fetchone()[0]
+
+            return {
+                "risk_distribution": risk_dist,
+                "top_entity_types": dict(top_entities),
+                "total_redacted_documents": redacted_count,
+            }
+        except sqlite3.Error as e:
+            logger.error(f"Error getting risk analytics: {e}")
+            return {}
+
+        # ========================================================================
     # OCR RESULTS TABLE OPERATIONS
     # ========================================================================
     
