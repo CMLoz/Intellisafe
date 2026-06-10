@@ -67,6 +67,9 @@ class ImagePreprocessor:
         coords = np.column_stack(np.where(thresh > 0))
         if coords.size == 0:
             return image
+        # cv2.minAreaRect expects coordinates in (x, y) order, but np.where returns (row, col) i.e. (y, x).
+        # Swap columns to convert to (x, y) format.
+        coords = coords[:, ::-1]
         rect = cv2.minAreaRect(coords)
         angle = rect[-1]
         if angle < -45:
@@ -146,23 +149,37 @@ class PaddleOCREngine:
         if len(image.shape) == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
         results = ocr.ocr(image, cls=True)
-        lines = results[0] if results else []
+        lines = results[0] if results and results[0] is not None else []
         texts = []
         confidences = []
+        word_boxes = []  # [{text, bbox:[x0,y0,x1,y1]}, ...]
         for line in lines:
             if len(line) < 2 or not line[1]:
                 continue
+            quad = line[0]   # [[x0,y0],[x1,y0],[x1,y1],[x0,y1]] (4 corners)
             text, score = line[1][0], line[1][1]
             if text:
                 texts.append(text)
             if isinstance(score, (int, float)):
                 confidences.append(score)
+            # Convert quad to axis-aligned bbox
+            if isinstance(quad, (list, tuple)) and len(quad) >= 2:
+                try:
+                    xs = [pt[0] for pt in quad]
+                    ys = [pt[1] for pt in quad]
+                    word_boxes.append({
+                        'text': text,
+                        'bbox': [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))],
+                    })
+                except Exception:
+                    pass
         text_output = " ".join(texts).strip()
         avg_confidence = (sum(confidences) / len(confidences)) * 100 if confidences else 0
         return {
             'text': text_output,
             'confidence': avg_confidence,
-            'word_count': len(text_output.split())
+            'word_count': len(text_output.split()),
+            'word_boxes': word_boxes,
         }
 
     def detect_layout(self, image: np.ndarray) -> List[Dict]:
@@ -170,8 +187,9 @@ class PaddleOCREngine:
         try:
             ocr = self._get_ocr()
             results = ocr.ocr(image, cls=True)
+            lines = results[0] if results and results[0] is not None else []
             boxes = []
-            for line in (results[0] if results else []):
+            for line in lines:
                 if len(line) >= 2 and isinstance(line[0], list):
                     box = line[0]
                     text = line[1][0] if line[1] else ''

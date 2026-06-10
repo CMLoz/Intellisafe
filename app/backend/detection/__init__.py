@@ -6,6 +6,7 @@ from .presidio_engine import PresidioEngine
 from .transformer_engine import TransformerEngine
 from .validation_pipeline import ValidationPipeline
 from .entity_aggregator import aggregate as aggregate_entities
+from .risk_classifier import RiskClassifier
 
 __all__ = [
 	"RegexEngine",
@@ -14,4 +15,5 @@ __all__ = [
 	"TransformerEngine",
 	"ValidationPipeline",
 	"aggregate_entities",
+	"RiskClassifier",
 ]

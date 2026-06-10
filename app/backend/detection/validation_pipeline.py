@@ -10,6 +10,7 @@ from .gliner_engine import GLiNEREngine
 from .presidio_engine import PresidioEngine
 from .transformer_engine import TransformerEngine
 from .entity_aggregator import aggregate as aggregate_entities
+from .risk_classifier import RiskClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +23,12 @@ class ValidationPipeline:
         gliner_model: str | None = None,
         presidio_language: str | None = None,
         transformer_model: str | None = None,
+        risk_classifier: RiskClassifier | None = None,
     ):
         self._gliner_model = gliner_model
         self._presidio_language = presidio_language
         self._transformer_model = transformer_model
+        self._risk_classifier = risk_classifier or RiskClassifier()
         self._gliner_engine: GLiNEREngine | None = None
         self._presidio_engine: PresidioEngine | None = None
         self._transformer_engine: TransformerEngine | None = None
@@ -79,6 +82,22 @@ class ValidationPipeline:
 
         for finding in findings:
             engine = finding.get("engine")
+            sources = finding.get("sources", [])
+            if not engine and isinstance(sources, list):
+                source_confidences = finding.get("source_confidences", {})
+                for source in sources:
+                    if source == "regex":
+                        summary["regex"]["count"] += 1
+                    elif source == "gliner":
+                        summary["gliner"]["count"] += 1
+                        confidence = source_confidences.get("gliner")
+                        if isinstance(confidence, (int, float)):
+                            gliner_scores.append(float(confidence))
+                    elif source == "presidio":
+                        summary["presidio"]["count"] += 1
+                        confidence = source_confidences.get("presidio")
+                        if isinstance(confidence, (int, float)):
+                            presidio_scores.append(float(confidence))
             if engine == "regex":
                 summary["regex"]["count"] += 1
             elif engine == "gliner":
@@ -117,16 +136,25 @@ class ValidationPipeline:
         """Run detection pipeline based on scan mode."""
         if mode not in {"quick", "standard", "deep"}:
             raise ValueError(f"Unsupported scan mode: {mode}")
+        aggregation_meta = {}
         # 1) Regex (fast conservative pass)
         regex_findings = RegexEngine.detect(text)
         if mode == "quick":
             findings = regex_findings
         else:
             # 2) GLiNER (contextual NER)
-            gliner_findings = self._get_gliner().detect(text)
+            try:
+                gliner_findings = self._get_gliner().detect(text)
+            except Exception as exc:
+                logger.warning("GLiNER unavailable; continuing with other detectors: %s", exc)
+                gliner_findings = []
 
             # 3) Presidio (recognizers & contextual scoring)
-            presidio_findings = self._get_presidio().detect(text)
+            try:
+                presidio_findings = self._get_presidio().detect(text)
+            except Exception as exc:
+                logger.warning("Presidio unavailable; continuing with other detectors: %s", exc)
+                presidio_findings = []
 
             # 4) Aggregate and compare outputs from all engines
             merged, aggregation_meta = aggregate_entities([
@@ -151,6 +179,10 @@ class ValidationPipeline:
         summary = RegexEngine.summarize(findings)
         confidence_breakdown = self._confidence_breakdown(findings)
 
+        findings = self._risk_classifier.classify(findings)
+
+        risk_distribution = self._risk_classifier.get_risk_distribution(findings)
+
         logger.info(
             "Validation pipeline completed: mode=%s findings=%s",
             mode,
@@ -161,4 +193,6 @@ class ValidationPipeline:
             "summary": summary,
             "validation_tier": mode,
             "confidence_breakdown": confidence_breakdown,
+            "risk_distribution": risk_distribution,
+            "aggregation_meta": aggregation_meta,
         }

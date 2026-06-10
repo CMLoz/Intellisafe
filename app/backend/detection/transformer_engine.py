@@ -10,8 +10,6 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional
 
-from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
-
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +43,8 @@ class TransformerEngine:
 
     def _load_pipeline(self):
         try:
+            from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
+
             tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
                 local_files_only=self.local_files_only,

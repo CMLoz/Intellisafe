@@ -1,0 +1,13 @@
+PySide6
+PyMuPDF
+python-docx
+opencv-python
+Pillow
+numpy
+paddleocr
+paddlepaddle
+gliner
+presidio-analyzer
+spacy
+transformers
+torch

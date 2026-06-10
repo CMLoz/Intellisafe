@@ -40,38 +40,50 @@ class RedactionEngine:
         image_path: str,
         findings: List[Dict],
         strategy: str = "blackout",
+        word_boxes: Optional[List[Dict]] = None,
+        preprocessing_steps: Optional[List[str]] = None,
     ) -> Dict:
-        """Return a redacted image (as bytes) and metadata for an image file."""
+        """Return a redacted image and metadata.
+
+        Args:
+            image_path:  Path to the source image.
+            findings:    Detection findings to redact.
+            strategy:    'blackout' | 'pixelate' | 'blur'.
+            word_boxes:  Optional list of {text, bbox:[x0,y0,x1,y1]} dicts
+                         returned by PaddleOCR.  When provided, each finding
+                         value is looked up in this list and the *exact* OCR
+                         pixel rect is used instead of the estimated fallback.
+            preprocessing_steps: Preprocessing steps applied during OCR scanning.
+                                 If provided, they are replicated before redacting
+                                 to ensure exact coordinate alignment.
+        """
         image = cv2.imread(image_path)
         if image is None:
             raise ValueError(f"Failed to load image: {image_path}")
 
+        if preprocessing_steps:
+            from app.backend.ocr_processor import OCRPipeline
+            pipeline = OCRPipeline()
+            image = pipeline.preprocess(image, preprocessing_steps)
+
         pil_img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(pil_img)
-        h, w = image.shape[:2]
+        img_h, img_w = image.shape[:2]
 
+        redacted_count = 0
         for finding in findings:
-            coords = self._resolve_box(finding, w, h)
+            coords = self._coords_for_finding(finding, word_boxes, img_w, img_h)
             if coords is None:
                 continue
             x1, y1, x2, y2 = coords
-            mode = self._mode_for(finding)
 
-            if mode == "full" or strategy == "blackout":
-                draw.rectangle([x1, y1, x2, y2], fill=(0, 0, 0))
-            elif strategy == "pixelate":
+            if strategy == "pixelate":
                 self._pixelate_region(pil_img, draw, x1, y1, x2, y2)
             elif strategy == "blur":
                 self._blur_region(pil_img, x1, y1, x2, y2)
-            else:
-                # mask (default partial for non-critical types)
-                mask_text = "****"
-                try:
-                    font = ImageFont.load_default()
-                except Exception:
-                    font = None
+            else:  # blackout (default)
                 draw.rectangle([x1, y1, x2, y2], fill=(0, 0, 0))
-                draw.text((x1 + 2, y1 + 2), mask_text, fill=(255, 255, 255), font=font)
+            redacted_count += 1
 
         buf = io.BytesIO()
         pil_img.save(buf, format="PNG")
@@ -85,7 +97,7 @@ class RedactionEngine:
             "format": "image/png",
             "original_format": Path(image_path).suffix.lower(),
             "strategy": strategy,
-            "findings_redacted": len(findings),
+            "findings_redacted": redacted_count,
         }
 
     def redact_pdf(
@@ -200,6 +212,162 @@ class RedactionEngine:
     # ------------------------------------------------------------------
     # Image-level helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clamp_coords(
+        x1: int, y1: int, x2: int, y2: int, img_w: int, img_h: int,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        x1 = max(0, min(x1, img_w - 1))
+        y1 = max(0, min(y1, img_h - 1))
+        x2 = max(x1 + 1, min(x2, img_w))
+        y2 = max(y1 + 1, min(y2, img_h))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return x1, y1, x2, y2
+
+    @staticmethod
+    def _merge_bboxes(
+        bboxes: List[List[int]], img_w: int, img_h: int,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        if not bboxes:
+            return None
+        x1 = max(0, min(int(b[0]) for b in bboxes))
+        y1 = max(0, min(int(b[1]) for b in bboxes))
+        x2 = min(img_w, max(int(b[2]) for b in bboxes))
+        y2 = min(img_h, max(int(b[3]) for b in bboxes))
+        return RedactionEngine._clamp_coords(x1, y1, x2, y2, img_w, img_h)
+
+    @staticmethod
+    def _subbox_for_chars(
+        wb: Dict,
+        char_start: int,
+        char_end: int,
+        img_w: int,
+        img_h: int,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Map a character span inside one OCR box to a tight pixel rectangle."""
+        bbox = wb.get("bbox")
+        text = wb.get("text") or ""
+        if not bbox or len(bbox) != 4 or not text:
+            return None
+
+        n = len(text)
+        char_start = max(0, min(char_start, n))
+        char_end = max(char_start + 1, min(char_end, n))
+        x0, y0, x1, y1 = (int(v) for v in bbox)
+        width = max(x1 - x0, 1)
+        sub_x0 = x0 + int(width * char_start / n)
+        sub_x1 = x0 + int(width * char_end / n)
+        if sub_x1 <= sub_x0:
+            sub_x1 = sub_x0 + max(2, width // n)
+        return RedactionEngine._clamp_coords(sub_x0, y0, sub_x1, y1, img_w, img_h)
+
+    @staticmethod
+    def _ocr_box_offsets(word_boxes: List[Dict]) -> List[int]:
+        offsets: List[int] = []
+        current = 0
+        for wb in word_boxes:
+            offsets.append(current)
+            current += len(wb.get("text") or "") + 1
+        return offsets
+
+    @staticmethod
+    def _coords_for_finding(
+        finding: Dict,
+        word_boxes: Optional[List[Dict]],
+        img_w: int,
+        img_h: int,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Return (x1, y1, x2, y2) for a finding.
+
+        Only redacts the exact detected value inside OCR boxes — never whole
+        lines or pages because a character span overlaps many boxes.
+        """
+        value = (finding.get("value") or "").strip()
+        if not value:
+            return None
+
+        raw = finding.get("box") or finding.get("bbox")
+        if raw and len(raw) == 4:
+            return RedactionEngine._clamp_coords(
+                int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3]), img_w, img_h,
+            )
+
+        if not word_boxes:
+            return None
+
+        val_lower = value.lower()
+        val_len = len(value)
+        start = finding.get("start")
+        box_offsets = RedactionEngine._ocr_box_offsets(word_boxes)
+        max_area = img_w * img_h * 0.25
+
+        def _accept(coords: Optional[Tuple[int, int, int, int]]) -> Optional[Tuple[int, int, int, int]]:
+            if coords is None:
+                return None
+            x1, y1, x2, y2 = coords
+            if (x2 - x1) * (y2 - y1) > max_area:
+                logger.warning(
+                    "Skipping oversized redaction box for %r (type=%s)",
+                    value[:40],
+                    finding.get("type"),
+                )
+                return None
+            return coords
+
+        # 1. Value appears inside a single OCR box — redact only that substring.
+        single_box_matches: List[Tuple[int, Tuple[int, int, int, int]]] = []
+        for idx, wb in enumerate(word_boxes):
+            wb_text = wb.get("text") or ""
+            hit = wb_text.lower().find(val_lower)
+            if hit < 0:
+                continue
+            coords = RedactionEngine._subbox_for_chars(
+                wb, hit, hit + val_len, img_w, img_h,
+            )
+            if coords:
+                single_box_matches.append((box_offsets[idx] + hit, coords))
+
+        if single_box_matches:
+            if len(single_box_matches) == 1 or start is None:
+                return _accept(single_box_matches[0][1])
+            best = min(single_box_matches, key=lambda item: abs(item[0] - int(start)))
+            return _accept(best[1])
+
+        # 2. Multi-line value: sliding window over consecutive OCR boxes.
+        wb_texts = [(wb.get("text") or "").lower().strip() for wb in word_boxes]
+        val_tokens = val_lower.split()
+        n_val = len(val_tokens)
+        for window_size in sorted(
+            {max(1, n_val - 1), n_val, n_val + 1},
+            key=lambda size: abs(size - n_val),
+        ):
+            for i in range(len(word_boxes) - window_size + 1):
+                joined = " ".join(wb_texts[i : i + window_size])
+                hit = joined.find(val_lower)
+                if hit < 0:
+                    continue
+                if window_size == 1:
+                    coords = RedactionEngine._subbox_for_chars(
+                        word_boxes[i], hit, hit + val_len, img_w, img_h,
+                    )
+                else:
+                    bboxes = [
+                        wb["bbox"]
+                        for wb in word_boxes[i : i + window_size]
+                        if wb.get("bbox") and len(wb["bbox"]) == 4
+                    ]
+                    coords = RedactionEngine._merge_bboxes(bboxes, img_w, img_h)
+                accepted = _accept(coords)
+                if accepted:
+                    return accepted
+
+        logger.debug(
+            "Could not locate %r in OCR boxes (type=%s); skipping image redaction",
+            value[:40],
+            finding.get("type"),
+        )
+        return None
 
     @staticmethod
     def _resolve_box(finding: Dict, img_w: int, img_h: int) -> Optional[Tuple[int, int, int, int]]:

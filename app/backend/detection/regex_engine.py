@@ -21,56 +21,66 @@ class RegexEngine:
             "type": "Email",
             "severity": "medium",
             "pattern": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+            "confidence": 0.92,
         },
         {
             "type": "Phone Number",
             "severity": "medium",
             "pattern": r"(?<!\w)(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{4}(?!\w)",
+            "confidence": 0.78,
         },
         {
             "type": "Credit Card",
             "severity": "high",
             "pattern": r"\b(?:\d[ -]*?){13,19}\b",
             "validator": "luhn",
+            "confidence": 0.97,
         },
         {
             "type": "Password",
             "severity": "high",
             "pattern": r"(?i)\b(?:password|passwd|pwd)\b\s*[:=]\s*['\"]?([^\s'\";,\]]{6,})",
             "group": 1,
+            "confidence": 0.95,
         },
         {
             "type": "API Key",
             "severity": "high",
             "pattern": r"\bAKIA[0-9A-Z]{16}\b",
+            "confidence": 0.98,
         },
         {
             "type": "API Key",
             "severity": "high",
             "pattern": r"\bAIza[0-9A-Za-z_-]{35}\b",
+            "confidence": 0.97,
         },
         {
             "type": "API Key",
             "severity": "high",
             "pattern": r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b",
+            "confidence": 0.96,
         },
         {
             "type": "API Key",
             "severity": "high",
             "pattern": r"(?i)\b(?:api[_-]?key|secret|access[_-]?token|auth[_-]?token|bearer)\b\s*[:=]\s*['\"]?([A-Za-z0-9._~+/=-]{16,})",
             "group": 1,
+            "confidence": 0.92,
         },
         {
             "type": "ID Number",
             "severity": "high",
             "pattern": r"\b\d{3}-\d{2}-\d{4}\b",
             "label": "SSN-like ID",
+            "confidence": 0.96,
         },
         {
             "type": "ID Number",
             "severity": "medium",
             "pattern": r"(?i)\b(?:employee|student|customer|account|user|member|passport|license|id)\s*(?:id|no|number|#)?\s*[:=]\s*['\"]?([A-Z0-9][A-Z0-9-]{4,24})",
             "group": 1,
+            "confidence": 0.72,
         },
     ]
 
@@ -112,6 +122,7 @@ class RegexEngine:
                         "line": RegexEngine._line_number(text, start),
                         "context": RegexEngine._context(text, start, end),
                         "engine": "regex",
+                        "confidence": spec.get("confidence", 0.7),
                     }
                 )
 

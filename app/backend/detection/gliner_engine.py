@@ -24,12 +24,18 @@ class GLiNEREngine:
     real runtime differs, adjust the adapter accordingly.
     """
 
-    DEFAULT_MODEL = "urchade/gliner_base-v2.1"
+    DEFAULT_MODEL = "urchade/gliner_medium-v2.1"
     FALLBACK_MODELS = (
-        "urchade/gliner_base-v2.1",
-        "urchade/gliner_small-v2.1",
         "urchade/gliner_medium-v2.1",
+        "urchade/gliner_base",
+        "urchade/gliner_small-v2.1",
     )
+    # Minimum confidence threshold — raised to 0.50 to cut low-confidence
+    # label-text false positives (e.g. "Phone" detected as a phone number).
+    CONFIDENCE_THRESHOLD = 0.50
+    # Minimum character length for a detected value to be kept.
+    MIN_VALUE_LENGTH = 3
+
     LABEL_CANDIDATES = [
         "person",
         "organization",
@@ -42,6 +48,13 @@ class GLiNEREngine:
         "bank account",
         "date of birth",
         "id number",
+        "social security number",
+        "tax id number",
+        "medical record number",
+        "driver license number",
+        "ip address",
+        "api key",
+        "password",
     ]
 
     LABEL_MAP = {
@@ -56,6 +69,24 @@ class GLiNEREngine:
         "bank account": "Bank Account",
         "date of birth": "Date of Birth",
         "id number": "ID Number",
+        "social security number": "ID Number",
+        "tax id number": "ID Number",
+        "medical record number": "ID Number",
+        "driver license number": "ID Number",
+        "ip address": "IP Address",
+        "api key": "API Key",
+        "password": "Password",
+    }
+
+    HIGH_RISK_LABELS = {"Credit Card", "Bank Account", "ID Number", "API Key", "Password"}
+    MEDIUM_RISK_LABELS = {"Email", "Phone Number", "Date of Birth", "IP Address"}
+
+    # Minimum digit count required per entity type (prevents label-text false positives).
+    DIGIT_REQUIREMENTS: dict = {
+        "Phone Number": 4,
+        "Credit Card": 8,
+        "ID Number": 3,
+        "Date of Birth": 1,
     }
 
     def __init__(self, model_name: str | None = None):
@@ -65,9 +96,7 @@ class GLiNEREngine:
 
     @staticmethod
     def _load_model(model_name: str):
-        candidates = [model_name]
-        if model_name not in GLiNEREngine.FALLBACK_MODELS:
-            candidates.extend(GLiNEREngine.FALLBACK_MODELS)
+        candidates = list(dict.fromkeys([model_name, *GLiNEREngine.FALLBACK_MODELS]))
 
         gliner_cls = None
         try:
@@ -96,13 +125,29 @@ class GLiNEREngine:
                 return gliner_cls(candidate)
             except Exception as exc:
                 last_error = exc
-                logger.warning("GLiNER model '%s' could not be loaded: %s", candidate, exc)
 
-        logger.error(
-            "GLiNER unavailable; continuing without contextual NER. Last error: %s",
-            last_error,
-        )
+        if candidates:
+            logger.warning(
+                "GLiNER model '%s' unavailable; contextual NER disabled. %s",
+                candidates[0],
+                str(last_error).split("\n")[0] if last_error else "",
+            )
         return None
+
+    @classmethod
+    def _is_valid_content(cls, normalized_label: str, value: str) -> bool:
+        """Return False when the value is clearly a label/placeholder rather than real PII."""
+        digit_count = sum(c.isdigit() for c in value)
+        min_digits = cls.DIGIT_REQUIREMENTS.get(normalized_label)
+        if min_digits is not None and digit_count < min_digits:
+            return False
+        if normalized_label == "Email" and "@" not in value:
+            return False
+        if normalized_label == "API Key" and len(value) < 8:
+            return False
+        if normalized_label == "IP Address" and digit_count < 4:
+            return False
+        return True
 
     def detect(self, text: str) -> List[Dict]:
         """Run GLiNER detection and return standardized findings."""
@@ -111,7 +156,9 @@ class GLiNEREngine:
 
         try:
             if hasattr(self._model, "predict_entities"):
-                raw = self._model.predict_entities(text, self.LABEL_CANDIDATES, threshold=0.45)
+                raw = self._model.predict_entities(
+                    text, self.LABEL_CANDIDATES, threshold=self.CONFIDENCE_THRESHOLD
+                )
             elif hasattr(self._model, "predict"):
                 raw = self._model.predict(text, self.LABEL_CANDIDATES)
             else:
@@ -139,11 +186,13 @@ class GLiNEREngine:
                 value = getattr(ent, "text", getattr(ent, "entity_text", text[start:end]))
 
             value = str(value).strip()
-            if not value:
-                # Some GLiNER variants supply no explicit text value.
+            if not value or len(value) < self.MIN_VALUE_LENGTH:
                 continue
 
             normalized_label = self.LABEL_MAP.get(label.lower(), label)
+            if not self._is_valid_content(normalized_label, value):
+                continue
+            severity = self._severity_for(normalized_label)
             key = (normalized_label, value, start, end)
             if key in seen:
                 continue
@@ -155,7 +204,7 @@ class GLiNEREngine:
                     "label": label,
                     "value": value,
                     "masked_value": value[:3] + "***" + (value[-3:] if len(value) > 3 else ""),
-                    "severity": "medium",
+                    "severity": severity,
                     "start": start,
                     "end": end,
                     "line": text.count("\n", 0, start) + 1,
@@ -167,3 +216,11 @@ class GLiNEREngine:
 
         logger.info("GLiNER detection found %s entities", len(findings))
         return findings
+
+    @classmethod
+    def _severity_for(cls, label: str) -> str:
+        if label in cls.HIGH_RISK_LABELS:
+            return "high"
+        if label in cls.MEDIUM_RISK_LABELS:
+            return "medium"
+        return "low"

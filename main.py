@@ -1170,6 +1170,7 @@ class MainWindow(QMainWindow):
             'text': result.get('text', ''),
             'confidence': result.get('confidence', 0),
             'word_count': result.get('word_count', 0),
+            'word_boxes': result.get('word_boxes', []),
             'engine': result.get('engine', 'paddleocr'),
             'fallback_used': result.get('fallback_used', False),
             'preprocessing_steps': result.get('preprocessing_steps_used', settings['selected_steps']),
@@ -1553,7 +1554,18 @@ class MainWindow(QMainWindow):
             path = fi.get('path', '')
             try:
                 if fmt in {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}:
-                    result = self._redaction_engine.redact_image(path, findings, strategy)
+                    # Use OCR word_boxes for pixel-accurate redaction bars
+                    word_boxes = (
+                        fi.get('ocr_result', {}).get('word_boxes')
+                        or []
+                    )
+                    preprocessing_steps = (
+                        fi.get('ocr_result', {}).get('preprocessing_steps')
+                        or []
+                    )
+                    result = self._redaction_engine.redact_image(
+                        path, findings, strategy, word_boxes=word_boxes or None, preprocessing_steps=preprocessing_steps
+                    )
                 elif fmt == '.pdf':
                     result = self._redaction_engine.redact_pdf(path, findings, strategy)
                 elif fmt in {'.txt', '.sql'}:

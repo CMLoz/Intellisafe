@@ -16,16 +16,16 @@ if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
 # Load Torch before Qt to avoid a Windows DLL initialization conflict where
-# importing PyQt6 first can prevent torch\lib\c10.dll from initializing.
+# importing Qt first can prevent torch\lib\c10.dll from initializing.
 try:
     import torch  # noqa: F401
 except ImportError:
     pass
 
 GLINER_MODEL_CHOICES = [
-    "urchade/gliner_small-v2.1",
-    "urchade/gliner_base-v2.1",
     "urchade/gliner_medium-v2.1",
+    "urchade/gliner_base",
+    "urchade/gliner_small-v2.1",
     "urchade/gliner_large-v2.1",
 ]
 
@@ -34,7 +34,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Install IntelliSafe dependencies")
     parser.add_argument(
         "--gliner-model",
-        default=GLINER_MODEL_CHOICES[1],
+        default=GLINER_MODEL_CHOICES[0],
         choices=GLINER_MODEL_CHOICES,
         help="GLiNER model to prefetch after installation",
     )
@@ -42,6 +42,11 @@ def parse_args():
         "--skip-gliner-download",
         action="store_true",
         help="Install packages only and skip GLiNER model prefetch",
+    )
+    parser.add_argument(
+        "--skip-spacy-download",
+        action="store_true",
+        help="Skip downloading the spaCy English model used by Presidio",
     )
     return parser.parse_args()
 
@@ -72,6 +77,26 @@ print('Loaded:', {model_name!r})
 
     print(f"⚠️  Could not prefetch GLiNER model: {model_name}")
     print("   The model will be downloaded on first use if the package supports it.")
+    return False
+
+
+def install_spacy_model(project_path: Path, model_name: str = "en_core_web_sm") -> bool:
+    """Install the English spaCy model Presidio uses for NLP recognizers."""
+    print("\n" + "=" * 70)
+    print(f"🧠 Installing spaCy model: {model_name}")
+    print("=" * 70)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "spacy", "download", model_name],
+        cwd=str(project_path),
+        check=False,
+    )
+    if result.returncode == 0:
+        print(f"✅ spaCy model installed: {model_name}")
+        return True
+
+    print(f"⚠️  Could not install {model_name}.")
+    print("   Presidio may still run with pattern recognizers, but NLP confidence will be weaker.")
     return False
 
 
@@ -116,6 +141,8 @@ def install_dependencies():
             print("   1. Run the application: python main.py")
             print("   2. Read QUICKSTART.md for getting started")
             print("   3. Test file upload functionality")
+            if not args.skip_spacy_download:
+                install_spacy_model(project_path)
             if not args.skip_gliner_download:
                 prefetch_gliner_model(project_path, args.gliner_model)
             return True
@@ -124,8 +151,11 @@ def install_dependencies():
             print(f"⚠️  Installation completed with warnings (return code: {result.returncode})")
             print("=" * 70)
             print("\n📝 You may need to install some packages manually:")
-            print("   pip install PyQt6")
-            print("   pip install gliner presidio-analyzer")
+            print("   pip install PySide6")
+            print("   pip install gliner presidio-analyzer spacy")
+            print("   python -m spacy download en_core_web_sm")
+            if not args.skip_spacy_download:
+                install_spacy_model(project_path)
             if not args.skip_gliner_download:
                 prefetch_gliner_model(project_path, args.gliner_model)
             return False
@@ -141,9 +171,10 @@ def check_critical_packages():
     print("=" * 70)
     
     critical_packages = {
-        'PyQt6': 'UI Framework',
+        'PySide6': 'UI Framework',
         'gliner': 'Graph-based NER (GLiNER)',
         'presidio_analyzer': 'Presidio Analyzer',
+        'spacy': 'Presidio NLP runtime',
         'transformers': 'ML Models',
         'fitz': 'PDF Processing (PyMuPDF)',
         'docx': 'Word Documents (python-docx)',
