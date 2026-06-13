@@ -1,8 +1,9 @@
 """Backend package exports."""
 
 from .privacy_risk_manager import PrivacyRiskManager
+from .sensitive_data_tracker import SensitiveDataTracker, compute_file_hash
 
-__all__ = ["PrivacyRiskManager", "RedactionEngine"]
+__all__ = ["PrivacyRiskManager", "RedactionEngine", "SensitiveDataTracker", "compute_file_hash"]
 
 
 def __getattr__(name):

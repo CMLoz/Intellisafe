@@ -3,6 +3,7 @@ IntelliSafe - Database Management Module
 Handles SQLite database operations for files, detections, and logs
 """
 
+import json
 import sqlite3
 import logging
 from pathlib import Path
@@ -117,6 +118,26 @@ class DatabaseManager:
             self._ensure_column(cursor, "files", "total_findings_count", "INTEGER DEFAULT 0")
             self._ensure_column(cursor, "files", "entity_type_counts", "TEXT DEFAULT '{}'")
 
+            # Sensitive-entity tracking columns on detections
+            self._ensure_column(cursor, "detections", "entity_type", "TEXT")
+            self._ensure_column(cursor, "detections", "entity_hash", "TEXT")
+            self._ensure_column(cursor, "detections", "char_start", "INTEGER")
+            self._ensure_column(cursor, "detections", "char_end", "INTEGER")
+            self._ensure_column(cursor, "detections", "confidence", "REAL")
+            self._ensure_column(cursor, "detections", "entity_value", "TEXT")
+            self._ensure_column(cursor, "files", "post_redaction_risk_score", "REAL")
+            self._ensure_column(cursor, "files", "post_redaction_risk_level", "TEXT")
+            self._ensure_column(cursor, "files", "post_redaction_findings_count", "INTEGER DEFAULT 0")
+            self._ensure_column(cursor, "ocr_results", "word_boxes_json", "TEXT")
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
             # Redactions log table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS redactions (
@@ -145,6 +166,7 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_ocr_file ON ocr_results(file_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_ocr_confidence ON ocr_results(confidence)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_redactions_file ON redactions(file_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_detections_entity_hash ON detections(entity_hash)')
             
             conn.commit()
             logger.info(f"Database initialized: {self.db_path}")
@@ -200,11 +222,21 @@ class DatabaseManager:
             logger.info(f"File added to database: {filename} (ID: {file_id})")
             return file_id
         except sqlite3.IntegrityError:
-            logger.debug("File already exists in database: %s — returning existing record ID.", file_path)
-            # Return existing file ID
+            logger.debug("File already exists in database: %s — updating record.", file_path)
             cursor.execute('SELECT id FROM files WHERE file_path = ?', (file_path,))
             result = cursor.fetchone()
-            return result[0] if result else None
+            if not result:
+                return None
+            file_id = result[0]
+            cursor.execute('''
+                UPDATE files
+                SET filename = ?, file_size = ?, file_format = ?, file_hash = ?,
+                    status = ?, error_message = ?, parsed_content_preview = ?,
+                    upload_date = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', (filename, file_size, file_format, file_hash, status, error_message, parsed_preview, file_id))
+            conn.commit()
+            return file_id
         except sqlite3.Error as e:
             logger.error(f"Error adding file to database: {e}")
             raise
@@ -305,35 +337,38 @@ class DatabaseManager:
     # DETECTIONS TABLE OPERATIONS
     # ========================================================================
     
-    def add_detection(self, file_id: int, detection_type: str, 
-                     pattern_matched: str, data_found: str,
-                     location_info: str = None, risk_level: str = 'medium') -> int:
-        """
-        Add detection result to database
-        
-        Args:
-            file_id: ID of the file
-            detection_type: Type of detection (regex, gliner, presidio, transformer)
-            pattern_matched: Pattern that matched
-            data_found: Actual data found (may be masked)
-            location_info: Where in file it was found
-            risk_level: Risk level (low, medium, high)
-            
-        Returns:
-            Detection ID
-        """
+    def add_detection(
+        self,
+        file_id: int,
+        detection_type: str,
+        pattern_matched: str,
+        data_found: str,
+        location_info: str = None,
+        risk_level: str = 'medium',
+        entity_type: str | None = None,
+        entity_hash: str | None = None,
+        char_start: int | None = None,
+        char_end: int | None = None,
+        confidence: float | None = None,
+        entity_value: str | None = None,
+    ) -> int:
+        """Add a single detection result to the database."""
         conn = self.connect()
         cursor = conn.cursor()
-        
+
         try:
             cursor.execute('''
-                INSERT INTO detections 
-                (file_id, detection_type, pattern_matched, data_found, 
-                 location_info, risk_level)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (file_id, detection_type, pattern_matched, data_found,
-                  location_info, risk_level))
-            
+                INSERT INTO detections
+                (file_id, detection_type, pattern_matched, data_found,
+                 location_info, risk_level, entity_type, entity_hash,
+                 char_start, char_end, confidence, entity_value)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                file_id, detection_type, pattern_matched, data_found,
+                location_info, risk_level, entity_type, entity_hash,
+                char_start, char_end, confidence, entity_value,
+            ))
+
             conn.commit()
             detection_id = cursor.lastrowid
             logger.info(f"Detection added: File {file_id}, Type {detection_type} (ID: {detection_id})")
@@ -341,6 +376,120 @@ class DatabaseManager:
         except sqlite3.Error as e:
             logger.error(f"Error adding detection: {e}")
             raise
+
+    def replace_detections_for_file(self, file_id: int, detections: List[Dict]) -> int:
+        """Replace all detections for a file (used on re-scan)."""
+        conn = self.connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('DELETE FROM detections WHERE file_id = ?', (file_id,))
+            inserted = 0
+            for row in detections:
+                cursor.execute('''
+                    INSERT INTO detections
+                    (file_id, detection_type, pattern_matched, data_found,
+                     location_info, risk_level, entity_type, entity_hash,
+                     char_start, char_end, confidence, entity_value)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    row.get("file_id", file_id),
+                    row.get("detection_type"),
+                    row.get("pattern_matched"),
+                    row.get("data_found"),
+                    row.get("location_info"),
+                    row.get("risk_level", "medium"),
+                    row.get("entity_type"),
+                    row.get("entity_hash"),
+                    row.get("char_start"),
+                    row.get("char_end"),
+                    row.get("confidence"),
+                    row.get("entity_value"),
+                ))
+                inserted += 1
+            conn.commit()
+            return inserted
+        except sqlite3.Error as e:
+            logger.error(f"Error replacing detections for file {file_id}: {e}")
+            raise
+
+    def get_file_by_path(self, file_path: str) -> Optional[Dict]:
+        """Get file record by absolute path."""
+        conn = self.connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT * FROM files WHERE file_path = ?', (file_path,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as e:
+            logger.error(f"Error retrieving file by path: {e}")
+            return None
+
+    def get_file_by_hash(self, file_hash: str, exclude_path: str | None = None) -> Optional[Dict]:
+        conn = self.connect()
+        cursor = conn.cursor()
+        if exclude_path:
+            cursor.execute(
+                'SELECT * FROM files WHERE file_hash = ? AND file_path != ? ORDER BY upload_date DESC LIMIT 1',
+                (file_hash, exclude_path),
+            )
+        else:
+            cursor.execute('SELECT * FROM files WHERE file_hash = ? ORDER BY upload_date DESC LIMIT 1', (file_hash,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_entity_tracking_summary(self, limit: int = 25) -> Dict:
+        """Summarize tracked sensitive entities across all files."""
+        conn = self.connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT COUNT(*) FROM detections')
+            total_entities = cursor.fetchone()[0]
+
+            cursor.execute('''
+                SELECT entity_type, COUNT(*) as count
+                FROM detections
+                WHERE entity_type IS NOT NULL
+                GROUP BY entity_type
+                ORDER BY count DESC
+                LIMIT ?
+            ''', (limit,))
+            by_type = {row[0]: row[1] for row in cursor.fetchall()}
+
+            cursor.execute('''
+                SELECT entity_hash, entity_type, COUNT(*) as occurrences,
+                       COUNT(DISTINCT file_id) as file_count
+                FROM detections
+                WHERE entity_hash IS NOT NULL
+                GROUP BY entity_hash
+                HAVING file_count > 1
+                ORDER BY occurrences DESC
+                LIMIT ?
+            ''', (limit,))
+            cross_file = [
+                {
+                    "entity_hash": row[0],
+                    "entity_type": row[1],
+                    "occurrences": row[2],
+                    "file_count": row[3],
+                }
+                for row in cursor.fetchall()
+            ]
+
+            cursor.execute('''
+                SELECT COUNT(*) FROM files
+                WHERE file_hash IS NOT NULL AND file_hash != ''
+            ''')
+            hashed_files = cursor.fetchone()[0]
+
+            return {
+                "total_tracked_entities": total_entities,
+                "entities_by_type": by_type,
+                "cross_file_entities": cross_file,
+                "hashed_files": hashed_files,
+            }
+        except sqlite3.Error as e:
+            logger.error(f"Error building entity tracking summary: {e}")
+            return {}
     
     def get_detections_for_file(self, file_id: int) -> List[Dict]:
         """Get all detections for a specific file"""
@@ -746,10 +895,112 @@ class DatabaseManager:
             logger.error(f"Error getting risk analytics: {e}")
             return {}
 
+    def set_setting(self, key: str, value: str) -> None:
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+        ''', (key, value))
+        conn.commit()
+
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute('SELECT value FROM app_settings WHERE key = ?', (key,))
+        row = cursor.fetchone()
+        return row[0] if row else default
+
+    def get_all_settings(self) -> Dict:
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute('SELECT key, value FROM app_settings')
+        result = {}
+        for row in cursor.fetchall():
+            raw = row[1]
+            try:
+                result[row[0]] = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                if raw in ("True", "False"):
+                    result[row[0]] = raw == "True"
+                else:
+                    result[row[0]] = raw
+        return result
+
+    def update_post_redaction_metadata(
+        self,
+        file_id: int,
+        risk_score: float,
+        risk_level: str,
+        findings_count: int,
+    ) -> bool:
+        conn = self.connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                UPDATE files
+                SET post_redaction_risk_score = ?,
+                    post_redaction_risk_level = ?,
+                    post_redaction_findings_count = ?
+                WHERE id = ?
+            ''', (risk_score, risk_level, findings_count, file_id))
+            conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.error(f"Error updating post-redaction metadata: {e}")
+            return False
+
+    def get_redaction_history(self, limit: int = 100) -> List[Dict]:
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT r.*, f.filename, f.file_path
+            FROM redactions r
+            JOIN files f ON f.id = r.file_id
+            ORDER BY r.redaction_timestamp DESC
+            LIMIT ?
+        ''', (limit,))
+        return [dict(row) for row in cursor.fetchall()]
+
         # ========================================================================
     # OCR RESULTS TABLE OPERATIONS
     # ========================================================================
     
+    def upsert_ocr_result(
+        self,
+        file_id: int,
+        extracted_text: str,
+        confidence: float,
+        preprocessing_steps: list | None = None,
+        word_count: int = 0,
+        language: str = 'eng',
+        validation_tier: str | None = None,
+        confidence_breakdown: dict | None = None,
+        word_boxes: list | None = None,
+    ) -> int:
+        conn = self.connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('DELETE FROM ocr_results WHERE file_id = ?', (file_id,))
+            steps_json = json.dumps(preprocessing_steps or [])
+            confidence_json = json.dumps(confidence_breakdown) if confidence_breakdown else None
+            boxes_json = json.dumps(word_boxes) if word_boxes else None
+            cursor.execute('''
+                INSERT INTO ocr_results
+                (file_id, extracted_text, confidence, preprocessing_steps, word_count,
+                 ocr_language, validation_tier, confidence_breakdown, word_boxes_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                file_id, extracted_text, confidence, steps_json, word_count,
+                language, validation_tier, confidence_json, boxes_json,
+            ))
+            conn.commit()
+            return cursor.lastrowid
+        except sqlite3.Error as e:
+            logger.error(f"Error upserting OCR result: {e}")
+            raise
+
     def add_ocr_result(
         self,
         file_id: int,
@@ -831,11 +1082,13 @@ class DatabaseManager:
             
             if row:
                 result = dict(row)
-                # Parse JSON preprocessing steps
-                import json
                 result['preprocessing_steps'] = json.loads(result['preprocessing_steps'])
                 if result.get('confidence_breakdown'):
                     result['confidence_breakdown'] = json.loads(result['confidence_breakdown'])
+                if result.get('word_boxes_json'):
+                    result['word_boxes'] = json.loads(result['word_boxes_json'])
+                else:
+                    result['word_boxes'] = []
                 return result
             return None
         except sqlite3.Error as e:
@@ -942,6 +1195,74 @@ class DatabaseManager:
         except sqlite3.Error as e:
             logger.error(f"Error deleting OCR result: {e}")
             return False
+
+    def cleanup_repetitive_data(self) -> Dict:
+        """Remove duplicate detections and redactions."""
+        conn = self.connect()
+        cursor = conn.cursor()
+        cleaned = {}
+
+        try:
+            cursor.execute('''
+                DELETE FROM detections
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM detections
+                    WHERE data_found IS NOT NULL AND data_found != ''
+                    GROUP BY file_id, data_found
+                ) AND data_found IS NOT NULL AND data_found != ''
+            ''')
+            cleaned['detections_duplicates_removed'] = cursor.rowcount
+            conn.commit()
+
+            cursor.execute('''
+                DELETE FROM redactions
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM redactions
+                    GROUP BY file_id, redaction_type, findings_redacted
+                )
+            ''')
+            cleaned['redactions_duplicates_removed'] = cursor.rowcount
+            conn.commit()
+
+            cursor.execute('VACUUM')
+            conn.commit()
+
+            cleaned['status'] = 'completed'
+            logger.info(f"Cleanup completed: {cleaned}")
+            return cleaned
+        except sqlite3.Error as e:
+            logger.error(f"Error cleaning repetitive data: {e}")
+            conn.rollback()
+            return {'error': str(e)}
+
+    def cleanup_duplicates_by_hash(self) -> Dict:
+        """Remove duplicate detections sharing the same entity_hash."""
+        conn = self.connect()
+        cursor = conn.cursor()
+        cleaned = {}
+
+        try:
+            cursor.execute('''
+                DELETE FROM detections
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM detections
+                    WHERE entity_hash IS NOT NULL AND entity_hash != ''
+                    GROUP BY entity_hash, file_id
+                ) AND entity_hash IS NOT NULL AND entity_hash != ''
+            ''')
+            cleaned['hash_duplicates_removed'] = cursor.rowcount
+            conn.commit()
+
+            cursor.execute('VACUUM')
+            conn.commit()
+
+            cleaned['status'] = 'completed'
+            logger.info(f"Hash cleanup completed: {cleaned}")
+            return cleaned
+        except sqlite3.Error as e:
+            logger.error(f"Error cleaning hash duplicates: {e}")
+            conn.rollback()
+            return {'error': str(e)}
 
 
 

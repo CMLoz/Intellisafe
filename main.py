@@ -13,6 +13,11 @@ from typing import Optional
 from app.backend.privacy_risk_manager import PrivacyRiskManager
 from app.backend.redaction_engine import RedactionEngine
 from app.backend.database import get_db
+from app.backend.sensitive_data_tracker import SensitiveDataTracker
+from app.backend.app_settings import AppSettings
+from app.backend.session_store import SessionStore
+from app.backend.compliance_engine import ComplianceEngine
+from app.backend.redaction_service import filter_findings_by_mode, run_redaction_for_file, selected_findings
 
 # Load Torch before Qt to avoid a Windows DLL initialization conflict where
 # importing Qt first can prevent torch\lib\c10.dll from initializing.
@@ -247,7 +252,7 @@ class FileHandler:
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QLabel, QFrame, QFileDialog, QListWidget, QListWidgetItem, QScrollArea,
-    QTextEdit, QCheckBox, QComboBox, QSizePolicy, QDialog
+    QTextEdit, QCheckBox, QComboBox, QSizePolicy, QDialog, QLineEdit,
 )
 from PySide6.QtCore import Qt, QSize, QMimeData, QTimer, Signal, QObject, QThread
 from PySide6.QtGui import QIcon, QFont, QDrag, QColor, QDropEvent, QPixmap
@@ -425,8 +430,11 @@ class FileListWidget(QWidget):
                 info['parsed_content'] = parse_result['content']
                 info['parsed_metadata'] = parse_result['metadata']
                 validator = self._get_validation_pipeline()
+                scan_mode = "standard"
+                if host is not None and hasattr(host, "_app_settings"):
+                    scan_mode = host._app_settings.get("default_scan_mode", "standard")
                 if validator:
-                    validation = validator.run(parse_result['content'], mode="standard")
+                    validation = validator.run(parse_result['content'], mode=scan_mode)
                     info['findings'] = validation['findings']
                     info['findings_summary'] = validation['summary']
                     info['validation_tier'] = validation['validation_tier']
@@ -440,10 +448,18 @@ class FileListWidget(QWidget):
                     info['confidence_breakdown'] = {}
                     info['regex_findings'] = []
                     info['regex_summary'] = {}
+                assessment = None
+                if host is not None and hasattr(host, "finalize_file_scan"):
+                    assessment = host.finalize_file_scan(info)
+                elif host is not None and hasattr(host, "_risk_manager"):
+                    assessment = host._risk_manager.assess(info.get('findings', []))
+                    info['risk_assessment'] = assessment
                 logger.info(f"Successfully parsed: {file_path.name}")
             else:
                 logger.error(f"Failed to parse {file_path.name}: {parse_result.get('error', 'Unknown error')}")
                 info['parse_error'] = parse_result.get('error', 'Unknown error')
+                if host is not None and hasattr(host, "finalize_file_scan"):
+                    host.finalize_file_scan(info)
 
             self.add_file_item(info)
 
@@ -464,7 +480,8 @@ class FileListWidget(QWidget):
             item_text = f"✗ {info['name']} ({size_mb:.2f} MB){warning} - Parse Error"
         elif 'parsed_content' in info:
             finding_count = len(info.get('findings', info.get('regex_findings', [])))
-            item_text = f"✓ {info['name']} ({size_mb:.2f} MB){warning} - {finding_count} findings"
+            dup = f" [dup:{info['duplicate_of']}]" if info.get('duplicate_of') else ""
+            item_text = f"✓ {info['name']} ({size_mb:.2f} MB){warning} - {finding_count} findings{dup}"
         elif info.get('processing_status'):
             item_text = f"{info['name']} ({size_mb:.2f} MB){warning} - {info['processing_status']}"
         else:
@@ -638,7 +655,14 @@ class MainWindow(QMainWindow):
         self._validation_pipeline = None
         self._pipeline_ready = False
         self._risk_manager = PrivacyRiskManager()
-        self._redaction_engine = RedactionEngine()
+        self._redaction_output_dir = str(Path(__file__).parent / "redacted_output")
+        self._redaction_engine = RedactionEngine(self._redaction_output_dir)
+        self._sensitive_tracker = SensitiveDataTracker(get_db())
+        self._app_settings = AppSettings(get_db())
+        self._session_store = SessionStore(get_db())
+        self._compliance_engine = ComplianceEngine()
+        self._load_app_settings()
+        self._reload_session_from_db()
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -653,6 +677,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.content_area, 1)
 
         self._start_background_init()
+        self._pending_redaction_mode = None
         self.switch_page("upload")
     
     def create_sidebar(self) -> QFrame:
@@ -695,9 +720,31 @@ class MainWindow(QMainWindow):
         
         # Settings
         settings_btn = QPushButton("⚙️ Settings")
+        settings_btn.clicked.connect(lambda: self.switch_page("settings"))
         layout.addWidget(settings_btn)
         
         return sidebar
+
+    def _load_app_settings(self):
+        settings = self._app_settings.load()
+        self._redaction_output_dir = settings.get("redaction_output_dir", self._redaction_output_dir)
+        self._redaction_engine.set_output_dir(self._redaction_output_dir)
+
+    def _reload_session_from_db(self):
+        if not self._app_settings.get("reload_session_on_startup", True):
+            return
+        try:
+            loaded = self._session_store.load_uploaded_files()
+            if loaded:
+                self.uploaded_files = loaded
+                logger.info("Restored %s file(s) from database", len(loaded))
+        except Exception as exc:
+            logger.warning("Could not reload session from database: %s", exc)
+
+    def _get_selected_findings(self, file_info: dict) -> list:
+        if "selected_finding_indices" not in file_info:
+            file_info["selected_finding_indices"] = list(range(len(file_info.get("findings", []))))
+        return selected_findings(file_info)
     
     def switch_page(self, page_id: str):
         """Switch to a different page"""
@@ -732,6 +779,8 @@ class MainWindow(QMainWindow):
             self.show_redact_page()
         elif page_id == "reports":
             self.show_reports_page()
+        elif page_id == "settings":
+            self.show_settings_page()
 
     def clear_layout(self, layout):
         """Remove all widgets and nested layouts from a layout."""
@@ -953,30 +1002,45 @@ class MainWindow(QMainWindow):
         title.setObjectName("title")
         layout.addWidget(title)
         
-        subtitle = QLabel("GDPR • HIPAA • DPA checks")
+        subtitle = QLabel("GDPR • HIPAA • DPA checks based on detected entities")
         subtitle.setObjectName("subtitle")
         layout.addWidget(subtitle)
         
         layout.addSpacing(30)
-        
-        # Compliance cards
-        for compliance, status in [("GDPR", "Not Checked"), ("HIPAA", "Not Checked"), ("DPA", "Not Checked")]:
+
+        if not self.uploaded_files:
+            layout.addWidget(QLabel("Upload and scan files to run compliance checks."))
+            layout.addStretch()
+            return
+
+        idx = 0
+        fi = self.uploaded_files[idx]
+        findings = fi.get("findings", [])
+        assessment = fi.get("compliance_assessment") or self._compliance_engine.assess(findings)
+
+        for framework in ("GDPR", "HIPAA", "DPA"):
+            result = assessment.get(framework, {})
+            status = result.get("status", "Not Checked")
             card = QFrame()
             card.setObjectName("card")
-            card_layout = QHBoxLayout(card)
-            
-            label = QLabel(compliance)
+            card_layout = QVBoxLayout(card)
+
+            header = QHBoxLayout()
+            label = QLabel(framework)
             label.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-            card_layout.addWidget(label)
-            
-            card_layout.addStretch()
-            
+            header.addWidget(label)
+            header.addStretch()
+            color = "#22c55e" if status == "Pass" else "#fbbf24" if status == "Review" else "#ef4444"
             status_label = QLabel(status)
-            status_label.setStyleSheet("color: #a0aec0;")
-            card_layout.addWidget(status_label)
-            
+            status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+            header.addWidget(status_label)
+            card_layout.addLayout(header)
+            card_layout.addWidget(QLabel(result.get("detail", "")))
+            card_layout.addWidget(QLabel(f"Action: {result.get('action', '')}"))
             layout.addWidget(card)
-        
+
+        layout.addSpacing(16)
+        layout.addWidget(QLabel(f"Based on: {fi['name']} ({len(findings)} findings)"))
         layout.addStretch()
     
     def show_protection_page(self):
@@ -988,36 +1052,47 @@ class MainWindow(QMainWindow):
         title.setObjectName("title")
         layout.addWidget(title)
         
-        subtitle = QLabel("Mask • AE-256 Encrypt • Redact • Export Safe Copy")
+        subtitle = QLabel("Mask • Redact • Export safe copies of scanned files")
         subtitle.setObjectName("subtitle")
         layout.addWidget(subtitle)
         
         layout.addSpacing(30)
         
-        # Protection options
-        for option, desc in [
-            ("Mask", "Hide sensitive data with asterisks"),
-            ("AE-256 Encrypt", "Encrypt sensitive data with AES-256"),
-            ("Redact", "Completely remove sensitive information"),
-            ("Export Safe Copy", "Export sanitized version of files"),
+        for option, desc, action in [
+            ("Mask (Partial)", "Hide part of sensitive values in text exports", lambda: self._open_redaction_with_mode("partial")),
+            ("Full Redact", "Black out or replace all high-risk fields", lambda: self._open_redaction_with_mode("full")),
+            ("Export Safe Copy", "Redact all uploaded files with findings", self._batch_redact_all),
         ]:
             card = QFrame()
             card.setObjectName("card")
             card_layout = QHBoxLayout(card)
             
+            text_col = QVBoxLayout()
             label = QLabel(option)
             label.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-            card_layout.addWidget(label)
+            text_col.addWidget(label)
+            text_col.addWidget(QLabel(desc))
+            card_layout.addLayout(text_col)
             
             card_layout.addStretch()
             
-            btn = QPushButton("Configure")
+            btn = QPushButton("Run")
             btn.setFixedWidth(120)
+            btn.clicked.connect(action)
             card_layout.addWidget(btn)
             
             layout.addWidget(card)
         
         layout.addStretch()
+
+    def _open_redaction_with_mode(self, mode: str):
+        self._pending_redaction_mode = mode
+        self.switch_page("redact")
+
+    def _batch_redact_all(self):
+        self.switch_page("redact")
+        if hasattr(self, "_run_batch_redaction"):
+            self._run_batch_redaction()
     
     def show_detection_page(self):
         """Display detection engines page"""
@@ -1378,6 +1453,80 @@ class MainWindow(QMainWindow):
         self.findings_findings_output.setPlainText(findings_text)
         self.findings_text_output.setPlainText(content or "No extracted text available.")
 
+    def finalize_file_scan(self, file_info: dict) -> dict:
+        """Compute risk, hash the file, and persist sensitive-data findings."""
+        findings = file_info.get('findings', file_info.get('regex_findings', []))
+        assessment = self._risk_manager.assess(findings)
+        file_info['risk_assessment'] = assessment
+        file_info['compliance_assessment'] = self._compliance_engine.assess(findings)
+        file_info.setdefault('selected_finding_indices', list(range(len(findings))))
+        try:
+            self._sensitive_tracker.persist_file_scan(file_info, findings, assessment)
+            if file_info.get("duplicate_of"):
+                logger.info(
+                    "Duplicate content detected: %s matches prior file %s",
+                    file_info["name"],
+                    file_info["duplicate_of"],
+                )
+        except Exception as exc:
+            logger.warning("Sensitive data tracking skipped: %s", exc)
+        return assessment
+
+    def _complete_redaction(self, fi: dict, result: dict, strategy: str, mode: str, output) -> str:
+        if result.get("skipped"):
+            return "No findings matched the selected redaction mode."
+
+        db = get_db()
+        file_id = fi.get("file_id")
+        if not file_id:
+            row = db.get_file_by_path(fi["path"])
+            file_id = row["id"] if row else None
+
+        if file_id:
+            self._sensitive_tracker.log_redaction(
+                file_id=file_id,
+                output_path=result.get("output_path", ""),
+                strategy=strategy,
+                mode=mode,
+                findings_redacted=result.get("findings_redacted", 0),
+            )
+            db.update_file_risk_metadata(
+                file_id=file_id,
+                risk_score=fi.get("risk_assessment", {}).get("risk_score", 0),
+                risk_level=fi.get("risk_assessment", {}).get("risk_level", "low"),
+                redacted_path=result.get("output_path"),
+                redaction_strategy=strategy,
+            )
+            fi["redacted_path"] = result.get("output_path")
+
+            if self._app_settings.get("rescan_after_redaction", True) and result.get("output_path"):
+                try:
+                    pipeline = self._get_validation_pipeline()
+                    if pipeline:
+                        post = self._sensitive_tracker.rescan_redacted_file(
+                            file_id, result["output_path"], self._risk_manager, pipeline,
+                        )
+                        fi["risk_assessment"]["post_redaction"] = post["assessment"]
+                except Exception as exc:
+                    logger.warning("Post-redaction rescan failed: %s", exc)
+
+        post = fi.get("risk_assessment", {}).get("post_redaction", {})
+        lines = [
+            "Redaction complete.",
+            f"Output folder: {self._redaction_output_dir}",
+            f"Output file: {result.get('output_path')}",
+            f"Findings redacted: {result.get('findings_redacted', 0)}",
+            f"Strategy: {strategy} / Mode: {mode}",
+        ]
+        if post:
+            lines.append(
+                f"Post-redaction risk: {post.get('risk_level', 'unknown')} "
+                f"({post.get('risk_score', 0)}) — {post.get('total_findings', 0)} findings remain"
+            )
+        if fi.get("duplicate_of"):
+            lines.append(f"Note: duplicate of previously scanned file '{fi['duplicate_of']}'")
+        return "\n".join(lines)
+
     def store_ocr_result_as_uploaded_file(self, result: dict):
         """Add or update an OCR image in the shared uploaded file list."""
         file_path = Path(result['file_path'])
@@ -1401,39 +1550,7 @@ class MainWindow(QMainWindow):
         file_info['regex_findings'] = file_info['findings']
         file_info['regex_summary'] = file_info['findings_summary']
 
-        assessment = self._risk_manager.assess(file_info.get('findings', []))
-        file_info['risk_assessment'] = assessment
-
-        db = get_db()
-        try:
-            file_id = db.add_file(
-                filename=file_info['name'],
-                file_path=file_info['path'],
-                file_size=file_info['size'],
-                file_format=file_info['format'],
-                status="success" if 'parse_error' not in file_info else "error",
-                error_message=file_info.get('parse_error'),
-            )
-            if file_id:
-                for finding in file_info.get('findings', []):
-                    db.add_detection(
-                        file_id=file_id,
-                        detection_type=finding.get('engine', 'unknown'),
-                        pattern_matched=finding.get('type', ''),
-                        data_found=finding.get('masked_value', ''),
-                        location_info=f"line {finding.get('line', '?')}",
-                        risk_level=finding.get('severity', finding.get('risk_level', 'medium')),
-                    )
-                db.update_file_risk_metadata(
-                    file_id=file_id,
-                    risk_score=assessment['risk_score'],
-                    risk_level=assessment['risk_level'],
-                    findings_count=assessment['total_findings'],
-                    entity_counts=assessment['findings_by_type'],
-                )
-        except Exception as exc:
-            logger.warning("DB persistence skipped: %s", exc)
-
+        self.finalize_file_scan(file_info)
         self._upsert_uploaded_file(file_info)
         return file_info
 
@@ -1460,12 +1577,18 @@ class MainWindow(QMainWindow):
         high_count = risk_dist.get("high", 0)
         medium_count = risk_dist.get("medium", 0)
         redacted_count = analytics.get("total_redacted_documents", 0)
+        tracking = {}
+        try:
+            tracking = get_db().get_entity_tracking_summary()
+        except Exception as exc:
+            logger.warning("Entity tracking summary unavailable: %s", exc)
 
         stats_layout = QHBoxLayout()
         for label_text, value, icon in [
             ("High-Risk Docs", str(high_count), "🔴"),
             ("Medium-Risk Docs", str(medium_count), "🟡"),
             ("Redacted Docs", str(redacted_count), "🛡️"),
+            ("Tracked Entities", str(tracking.get("total_tracked_entities", 0)), "🔎"),
         ]:
             card = QFrame()
             card.setObjectName("card")
@@ -1493,6 +1616,101 @@ class MainWindow(QMainWindow):
         else:
             layout.addWidget(QLabel("No entity data available yet."))
 
+        layout.addSpacing(20)
+        tracking_title = QLabel("Sensitive Data Tracking")
+        tracking_title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        layout.addWidget(tracking_title)
+
+        hashed_files = tracking.get("hashed_files", 0)
+        cross_file = tracking.get("cross_file_entities", [])
+        layout.addWidget(QLabel(f"Files with content hashes: {hashed_files}"))
+        if cross_file:
+            layout.addWidget(QLabel("Entities appearing in multiple files:"))
+            for item in cross_file[:8]:
+                row = QHBoxLayout()
+                row.addWidget(QLabel(f"{item.get('entity_type', 'Unknown')}"))
+                row.addStretch()
+                row.addWidget(
+                    QLabel(
+                        f"{item.get('file_count', 0)} files · "
+                        f"{item.get('occurrences', 0)} hits · "
+                        f"hash {str(item.get('entity_hash', ''))[:10]}…"
+                    )
+                )
+                layout.addLayout(row)
+        else:
+            layout.addWidget(QLabel("No cross-file entity matches recorded yet."))
+
+        layout.addStretch()
+
+    def show_settings_page(self):
+        layout = self.content_layout
+        layout.setContentsMargins(40, 40, 40, 40)
+
+        title = QLabel("Settings")
+        title.setObjectName("title")
+        layout.addWidget(title)
+        subtitle = QLabel("Defaults for scanning, redaction, and database session restore")
+        subtitle.setObjectName("subtitle")
+        layout.addWidget(subtitle)
+        layout.addSpacing(20)
+
+        scan_combo = QComboBox()
+        scan_combo.addItem("Quick Scan", "quick")
+        scan_combo.addItem("Standard", "standard")
+        scan_combo.addItem("Deep Analysis", "deep")
+        current_scan = self._app_settings.get("default_scan_mode", "standard")
+        scan_combo.setCurrentIndex(max(0, ["quick", "standard", "deep"].index(current_scan)))
+
+        strategy_combo = QComboBox()
+        strategy_combo.addItems(["blackout", "pixelate", "blur"])
+        strategy_combo.setCurrentText(self._app_settings.get("default_redaction_strategy", "blackout"))
+
+        mode_combo = QComboBox()
+        mode_combo.addItems(["auto", "full", "partial"])
+        mode_combo.setCurrentText(self._app_settings.get("default_redaction_mode", "auto"))
+
+        output_input = QLineEdit(self._redaction_output_dir)
+        reload_check = QCheckBox("Reload previous session from database on startup")
+        reload_check.setChecked(bool(self._app_settings.get("reload_session_on_startup", True)))
+        rescan_check = QCheckBox("Re-scan redacted files and update post-redaction risk")
+        rescan_check.setChecked(bool(self._app_settings.get("rescan_after_redaction", True)))
+
+        form = QVBoxLayout()
+        for label, widget in [
+            ("Default document scan mode", scan_combo),
+            ("Default redaction strategy", strategy_combo),
+            ("Default redaction mode", mode_combo),
+            ("Default redaction output folder", output_input),
+        ]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addWidget(widget, 1)
+            form.addLayout(row)
+        form.addWidget(reload_check)
+        form.addWidget(rescan_check)
+        layout.addLayout(form)
+
+        status = QLabel("")
+        layout.addWidget(status)
+
+        def save_settings():
+            out_dir = output_input.text().strip() or self._redaction_output_dir
+            self._app_settings.save_many({
+                "default_scan_mode": scan_combo.currentData(),
+                "default_redaction_strategy": strategy_combo.currentText(),
+                "default_redaction_mode": mode_combo.currentText(),
+                "redaction_output_dir": out_dir,
+                "reload_session_on_startup": reload_check.isChecked(),
+                "rescan_after_redaction": rescan_check.isChecked(),
+            })
+            self._redaction_output_dir = out_dir
+            self._redaction_engine.set_output_dir(out_dir)
+            status.setText("Settings saved to database.")
+
+        save_btn = QPushButton("Save Settings")
+        save_btn.clicked.connect(save_settings)
+        layout.addWidget(save_btn)
         layout.addStretch()
 
     def show_redact_page(self):
@@ -1514,104 +1732,159 @@ class MainWindow(QMainWindow):
             return
 
         file_list = QListWidget()
-        file_list.setMinimumWidth(320)
+        file_list.setMinimumWidth(280)
         for fi in self.uploaded_files:
             risk = fi.get('risk_assessment', {}).get('risk_level', 'unknown')
             file_list.addItem(f"{fi['name']} [{risk.upper()}]")
-        layout.addWidget(file_list)
+
+        findings_list = QListWidget()
+        findings_list.setMinimumWidth(360)
+
+        def refresh_findings_panel():
+            findings_list.clear()
+            idx = file_list.currentRow()
+            if idx < 0 or idx >= len(self.uploaded_files):
+                return
+            fi = self.uploaded_files[idx]
+            findings = fi.get("findings", [])
+            fi.setdefault("selected_finding_indices", list(range(len(findings))))
+            for i, finding in enumerate(findings):
+                checked = i in fi["selected_finding_indices"]
+                label = (
+                    f"{'☑' if checked else '☐'} {finding.get('type', '?')}: "
+                    f"{finding.get('masked_value', finding.get('value', ''))}"
+                )
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, i)
+                findings_list.addItem(item)
+
+        def toggle_finding(item: QListWidgetItem):
+            idx = file_list.currentRow()
+            if idx < 0:
+                return
+            fi = self.uploaded_files[idx]
+            finding_idx = item.data(Qt.ItemDataRole.UserRole)
+            selected = set(fi.get("selected_finding_indices", []))
+            if finding_idx in selected:
+                selected.discard(finding_idx)
+            else:
+                selected.add(finding_idx)
+            fi["selected_finding_indices"] = sorted(selected)
+            refresh_findings_panel()
+
+        file_list.currentRowChanged.connect(lambda _row: refresh_findings_panel())
+        findings_list.itemClicked.connect(toggle_finding)
+
+        lists_row = QHBoxLayout()
+        lists_row.addWidget(file_list)
+        lists_row.addWidget(findings_list, 1)
+        layout.addLayout(lists_row)
 
         strat_layout = QHBoxLayout()
         strat_layout.addWidget(QLabel("Strategy:"))
         strategy_combo = QComboBox()
         strategy_combo.addItems(["blackout", "pixelate", "blur"])
+        strategy_combo.setCurrentText(self._app_settings.get("default_redaction_strategy", "blackout"))
         strat_layout.addWidget(strategy_combo)
         strat_layout.addSpacing(16)
         strat_layout.addWidget(QLabel("Mode:"))
         mode_combo = QComboBox()
         mode_combo.addItems(["auto", "full", "partial"])
+        pending_mode = getattr(self, "_pending_redaction_mode", None)
+        mode_combo.setCurrentText(pending_mode or self._app_settings.get("default_redaction_mode", "auto"))
+        self._pending_redaction_mode = None
         strat_layout.addWidget(mode_combo)
         layout.addLayout(strat_layout)
+
+        output_dir_layout = QHBoxLayout()
+        output_dir_layout.addWidget(QLabel("Output folder:"))
+        output_dir_input = QLineEdit(self._redaction_output_dir)
+        output_dir_input.setPlaceholderText("Choose where redacted files are saved")
+        output_dir_layout.addWidget(output_dir_input, 1)
+
+        def browse_output_dir():
+            start_dir = output_dir_input.text().strip() or self._redaction_output_dir
+            chosen = QFileDialog.getExistingDirectory(
+                self,
+                "Select Redacted Output Folder",
+                start_dir,
+            )
+            if chosen:
+                output_dir_input.setText(chosen)
+
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(browse_output_dir)
+        output_dir_layout.addWidget(browse_btn)
+        layout.addLayout(output_dir_layout)
 
         output = QTextEdit()
         output.setReadOnly(True)
         output.setPlaceholderText("Redaction output will appear here...")
         layout.addWidget(output, 1)
 
-        def run_redaction():
-            idx = file_list.currentRow()
+        def run_redaction_for_index(idx: int, strategy: str, mode: str) -> str | None:
             if idx < 0 or idx >= len(self.uploaded_files):
-                output.setText("Select a file first.")
-                return
+                return "Select a file first."
             fi = self.uploaded_files[idx]
-            findings = fi.get('findings', [])
+            findings = self._get_selected_findings(fi)
             if not findings:
-                output.setText("No findings to redact for this file.")
-                return
-
-            strategy = strategy_combo.currentText()
-            mode = mode_combo.currentText()
+                return "No findings selected to redact."
             fmt = fi.get('format', '').lower()
             path = fi.get('path', '')
+            output_dir = output_dir_input.text().strip()
+            if not output_dir:
+                return "Please choose an output folder for redacted files."
+            self._redaction_output_dir = output_dir
+            self._redaction_engine.set_output_dir(output_dir)
+            self._app_settings.set("redaction_output_dir", output_dir)
+            if fmt not in {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.pdf', '.docx', '.txt', '.sql'}:
+                return "Redaction for this file type is not yet supported."
+            result = run_redaction_for_file(
+                self._redaction_engine, fi, findings, strategy, mode,
+            )
+            return self._complete_redaction(fi, result, strategy, mode, output)
+
+        def run_redaction():
+            idx = file_list.currentRow()
+            strategy = strategy_combo.currentText()
+            mode = mode_combo.currentText()
             try:
-                if fmt in {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}:
-                    # Use OCR word_boxes for pixel-accurate redaction bars
-                    word_boxes = (
-                        fi.get('ocr_result', {}).get('word_boxes')
-                        or []
-                    )
-                    preprocessing_steps = (
-                        fi.get('ocr_result', {}).get('preprocessing_steps')
-                        or []
-                    )
-                    result = self._redaction_engine.redact_image(
-                        path, findings, strategy, word_boxes=word_boxes or None, preprocessing_steps=preprocessing_steps
-                    )
-                elif fmt == '.pdf':
-                    result = self._redaction_engine.redact_pdf(path, findings, strategy)
-                elif fmt in {'.txt', '.sql'}:
-                    result = self._redaction_engine.redact_text_file(path, findings)
-                else:
-                    output.setText("Redaction for this file type is not yet supported.")
-                    return
-
-                db = get_db()
-                try:
-                    row = db.connect().execute(
-                        "SELECT id FROM files WHERE file_path = ?", (fi['path'],)
-                    ).fetchone()
-                    if row:
-                        db.add_redaction(
-                            file_id=row[0],
-                            redaction_type="full_run",
-                            mode=mode,
-                            strategy=strategy,
-                            output_path=result.get('output_path'),
-                            findings_redacted=result.get('findings_redacted', len(findings)),
-                        )
-                        db.update_file_risk_metadata(
-                            file_id=row[0],
-                            risk_score=fi.get('risk_assessment', {}).get('risk_score', 0),
-                            risk_level=fi.get('risk_assessment', {}).get('risk_level', 'low'),
-                            redacted_path=result.get('output_path'),
-                            redaction_strategy=strategy,
-                        )
-                except Exception as db_exc:
-                    logger.warning("Redaction DB logging failed: %s", db_exc)
-
-                output.setText(
-                    f"Redaction complete.\n"
-                    f"Output: {result.get('output_path')}\n"
-                    f"Findings redacted: {result.get('findings_redacted', len(findings))}\n"
-                    f"Strategy: {strategy} / Mode: {mode}"
-                )
+                message = run_redaction_for_index(idx, strategy, mode)
+                output.setText(message or "Redaction finished.")
             except Exception as exc:
                 output.setText(f"Redaction failed: {exc}")
+
+        def run_batch_redaction():
+            strategy = strategy_combo.currentText()
+            mode = mode_combo.currentText()
+            lines = []
+            for idx, fi in enumerate(self.uploaded_files):
+                if not fi.get("findings"):
+                    continue
+                try:
+                    msg = run_redaction_for_index(idx, strategy, mode)
+                    if msg and "complete" in msg.lower():
+                        lines.append(f"✓ {fi['name']}")
+                    elif msg:
+                        lines.append(f"– {fi['name']}: {msg}")
+                except Exception as exc:
+                    lines.append(f"✗ {fi['name']}: {exc}")
+            output.setText("\n".join(lines) if lines else "No files with findings to redact.")
+
+        self._run_batch_redaction = run_batch_redaction
 
         btn_layout = QHBoxLayout()
         redact_btn = QPushButton("Generate Redacted Copy")
         redact_btn.clicked.connect(run_redaction)
         btn_layout.addWidget(redact_btn)
+        batch_btn = QPushButton("Redact All Files")
+        batch_btn.clicked.connect(run_batch_redaction)
+        btn_layout.addWidget(batch_btn)
         layout.addLayout(btn_layout)
+
+        if self.uploaded_files:
+            file_list.setCurrentRow(0)
+            refresh_findings_panel()
         layout.addStretch()
 
     def show_reports_page(self):
@@ -1660,6 +1933,14 @@ class MainWindow(QMainWindow):
         btn_export = QPushButton("Export to JSON")
         btn_export.clicked.connect(self.export_json_report)
         buttons_layout.addWidget(btn_export)
+
+        btn_redactions = QPushButton("Redaction History (DB)")
+        btn_redactions.clicked.connect(self.show_redaction_history_report)
+        buttons_layout.addWidget(btn_redactions)
+
+        btn_reload = QPushButton("Reload Session from DB")
+        btn_reload.clicked.connect(self.reload_session_report)
+        buttons_layout.addWidget(btn_reload)
         
         layout.addLayout(buttons_layout)
         layout.addSpacing(20)
@@ -1682,107 +1963,142 @@ class MainWindow(QMainWindow):
         
         layout.addStretch()
     
+    def _db_files_as_report_rows(self) -> list:
+        db = get_db()
+        rows = db.get_all_files(limit=500)
+        report_files = []
+        for row in rows:
+            findings = db.get_detections_for_file(row["id"])
+            high = sum(1 for f in findings if str(f.get("risk_level", "")).lower() == "high")
+            report_files.append({
+                "name": row.get("filename"),
+                "path": row.get("file_path"),
+                "size": row.get("file_size", 0),
+                "format": row.get("file_format"),
+                "file_hash": row.get("file_hash"),
+                "parse_error": row.get("error_message") if row.get("status") == "error" else None,
+                "parsed_content": row.get("parsed_content_preview"),
+                "regex_findings": findings,
+                "risk_assessment": {
+                    "risk_level": row.get("risk_level"),
+                    "risk_score": row.get("risk_score"),
+                    "post_redaction": {
+                        "risk_level": row.get("post_redaction_risk_level"),
+                        "risk_score": row.get("post_redaction_risk_score"),
+                        "total_findings": row.get("post_redaction_findings_count"),
+                    } if row.get("post_redaction_risk_score") is not None else None,
+                },
+                "_high_count": high,
+                "_finding_count": len(findings),
+                "redacted_path": row.get("redacted_version_path"),
+            })
+        return report_files
+
+    def reload_session_report(self):
+        self._reload_session_from_db()
+        self.refresh_upload_file_list()
+        self.refresh_findings_page()
+        self.reports_display.setText(
+            f"Reloaded {len(self.uploaded_files)} file(s) from database into the current session."
+        )
+
+    def show_redaction_history_report(self):
+        history = get_db().get_redaction_history(limit=100)
+        if not history:
+            self.reports_display.setText("No redaction history in database.")
+            return
+        report = "REDACTION HISTORY (DATABASE)\n" + "=" * 80 + "\n\n"
+        for i, row in enumerate(history, 1):
+            report += (
+                f"{i}. {row.get('filename')} → {row.get('output_path')}\n"
+                f"   Strategy: {row.get('strategy')} | Mode: {row.get('mode')} | "
+                f"Redacted: {row.get('findings_redacted')}\n"
+                f"   When: {row.get('redaction_timestamp')}\n\n"
+            )
+        self.reports_display.setText(report)
+
     def show_all_files_report(self):
-        """Display all files uploaded during this session."""
-        if not self.uploaded_files:
-            self.reports_display.setText("No files uploaded in this session.")
+        """Display all files stored in the database."""
+        report_files = self._db_files_as_report_rows()
+        if not report_files:
+            self.reports_display.setText("No files in database.")
             return
 
-        report = "ALL UPLOADED FILES\n"
+        report = "ALL FILES (DATABASE)\n"
         report += "=" * 80 + "\n\n"
-        report += self.build_files_report(self.uploaded_files)
-        report += f"\nTotal files: {len(self.uploaded_files)}"
-
+        report += self.build_files_report(report_files)
+        report += f"\nTotal files: {len(report_files)}"
         self.reports_display.setText(report)
-        logger.info(f"Displayed {len(self.uploaded_files)} uploaded files")
     
     def show_recent_files_report(self):
-        """Display files uploaded during this session."""
-        if not self.uploaded_files:
-            self.reports_display.setText("No files uploaded in this session.")
+        """Display files uploaded in the last 7 days from the database."""
+        db_files = get_db().get_recent_files(days=7, limit=200)
+        if not db_files:
+            self.reports_display.setText("No files uploaded in the last 7 days.")
             return
 
-        report = "RECENT FILES (Current Session)\n"
+        report = "RECENT FILES (DATABASE — LAST 7 DAYS)\n"
         report += "=" * 80 + "\n\n"
-        report += self.build_files_report(self.uploaded_files)
-        report += f"\nTotal session files: {len(self.uploaded_files)}"
-
+        for i, row in enumerate(db_files, 1):
+            report += (
+                f"{i}. {row.get('filename')}\n"
+                f"   Path: {row.get('file_path')}\n"
+                f"   Uploaded: {row.get('upload_date')}\n"
+                f"   Risk: {row.get('risk_level')} ({row.get('risk_score')})\n"
+                f"   Findings: {row.get('total_findings_count', 0)}\n"
+                f"   Redacted: {row.get('redacted_version_path') or 'No'}\n\n"
+            )
+        report += f"Total: {len(db_files)}"
         self.reports_display.setText(report)
-        logger.info(f"Displayed {len(self.uploaded_files)} recent session files")
     
     def show_high_risk_report(self):
-        """Display high-risk regex detections from uploaded files."""
-        high_risk_findings = []
-        for file_info in self.uploaded_files:
-            for finding in file_info.get('regex_findings', []):
-                if finding.get('severity') == 'high':
-                    high_risk_findings.append((file_info, finding))
-
-        if not high_risk_findings:
-            self.reports_display.setText("No high-risk regex detections found in uploaded files.")
+        """Display high-risk detections from the database."""
+        detections = get_db().get_high_risk_detections(limit=200)
+        if not detections:
+            self.reports_display.setText("No high-risk detections in database.")
             return
 
-        report = "HIGH-RISK REGEX DETECTIONS\n"
+        report = "HIGH-RISK DETECTIONS (DATABASE)\n"
         report += "=" * 80 + "\n\n"
-
-        for i, (file_info, finding) in enumerate(high_risk_findings, 1):
-            report += f"{i}. File: {file_info['name']}\n"
-            report += f"   Detection Type: {finding['type']}\n"
-            report += f"   Risk Level: {finding['severity'].upper()}\n"
-            report += f"   Data Found: {finding['masked_value']}\n"
-            report += f"   Line: {finding['line']}\n"
-            report += f"   Context: {finding['context']}\n"
-            report += "\n"
-
-        report += f"\nTotal high-risk detections: {len(high_risk_findings)}"
+        for i, finding in enumerate(detections, 1):
+            report += (
+                f"{i}. File: {finding.get('filename')}\n"
+                f"   Type: {finding.get('entity_type') or finding.get('pattern_matched')}\n"
+                f"   Data: {finding.get('data_found')}\n"
+                f"   Location: {finding.get('location_info')}\n"
+                f"   When: {finding.get('detection_timestamp')}\n\n"
+            )
+        report += f"\nTotal: {len(detections)}"
         self.reports_display.setText(report)
-        logger.info(f"Displayed {len(high_risk_findings)} high-risk regex detections")
     
     def show_statistics_report(self):
-        """Display current session statistics."""
-        total_files = len(self.uploaded_files)
-        parsed_files = sum(1 for file_info in self.uploaded_files if 'parsed_content' in file_info)
-        parse_errors = sum(1 for file_info in self.uploaded_files if 'parse_error' in file_info)
-        total_size = sum(file_info.get('size', 0) for file_info in self.uploaded_files)
-        all_findings = [
-            finding
-            for file_info in self.uploaded_files
-            for finding in file_info.get('regex_findings', [])
-        ]
+        """Display database-wide statistics."""
+        stats = get_db().get_overall_stats()
+        risk = get_db().get_risk_analytics()
+        tracking = get_db().get_entity_tracking_summary()
 
-        severity_counts = {}
-        type_counts = {}
-        for finding in all_findings:
-            severity = finding.get('severity', 'unknown')
-            finding_type = finding.get('type', 'Unknown')
-            severity_counts[severity] = severity_counts.get(severity, 0) + 1
-            type_counts[finding_type] = type_counts.get(finding_type, 0) + 1
-
-        report = "SESSION STATISTICS\n"
+        report = "DATABASE STATISTICS\n"
         report += "=" * 80 + "\n\n"
-        report += f"Total Files Uploaded: {total_files}\n"
-        report += f"Files Parsed/Scanned: {parsed_files}\n"
-        report += f"Files With Parse Errors: {parse_errors}\n"
-        report += f"Total Storage Used: {total_size:,} bytes ({total_size/1024/1024:.2f} MB)\n"
-        report += f"Total Regex Detections: {len(all_findings)}\n"
+        report += f"Total Files: {stats.get('total_files', 0)}\n"
+        report += f"Total Storage: {stats.get('total_size_bytes', 0):,} bytes\n"
+        report += f"Total Detections: {stats.get('total_detections', 0)}\n"
+        report += f"Redacted Documents: {risk.get('total_redacted_documents', 0)}\n"
+        report += f"Tracked Entities: {tracking.get('total_tracked_entities', 0)}\n"
+        report += f"Hashed Files: {tracking.get('hashed_files', 0)}\n"
 
-        report += "\nSeverity Distribution:\n"
-        if severity_counts:
-            for severity, count in sorted(severity_counts.items()):
-                percentage = (count / len(all_findings) * 100) if all_findings else 0
-                report += f"  {severity.upper()}: {count} ({percentage:.1f}%)\n"
-        else:
-            report += "  No detections yet\n"
+        report += "\nRisk Distribution (files):\n"
+        for level, count in risk.get("risk_distribution", {}).items():
+            report += f"  {level}: {count}\n"
 
-        report += "\nDetection Type Distribution:\n"
-        if type_counts:
-            for finding_type, count in sorted(type_counts.items()):
-                report += f"  {finding_type}: {count}\n"
-        else:
-            report += "  No detections yet\n"
+        report += "\nDetection Risk Distribution:\n"
+        for level, count in stats.get("risk_distribution", {}).items():
+            report += f"  {level}: {count}\n"
+
+        report += "\nTop Entity Types:\n"
+        for entity, count in list(risk.get("top_entity_types", {}).items())[:10]:
+            report += f"  {entity}: {count}\n"
 
         self.reports_display.setText(report)
-        logger.info("Displayed session statistics")
 
     def build_files_report(self, files: list) -> str:
         """Build a text report for uploaded file records."""
@@ -1797,32 +2113,60 @@ class MainWindow(QMainWindow):
             report += f"   Size: {file_info['size']:,} bytes\n"
             report += f"   Format: {file_info['format']}\n"
             report += f"   Status: {status}\n"
-            report += f"   Regex Findings: {len(findings)} total, {high_findings} high risk\n"
+            if file_info.get('file_hash'):
+                report += f"   SHA-256: {file_info['file_hash']}\n"
+            risk = file_info.get('risk_assessment', {})
+            if risk:
+                report += f"   Risk: {risk.get('risk_level', 'unknown')} ({risk.get('risk_score', 0)})\n"
+            report += f"   Findings: {file_info.get('_finding_count', len(findings))} total, {file_info.get('_high_count', high_findings)} high risk\n"
+            if file_info.get('redacted_path'):
+                report += f"   Redacted copy: {file_info['redacted_path']}\n"
+            post = (file_info.get('risk_assessment') or {}).get('post_redaction')
+            if post and post.get('risk_score') is not None:
+                report += (
+                    f"   Post-redaction risk: {post.get('risk_level')} "
+                    f"({post.get('risk_score')}) — {post.get('total_findings', 0)} findings remain\n"
+                )
             if 'parse_error' in file_info:
                 report += f"   Error: {file_info['parse_error']}\n"
             report += "\n"
         return report
     
     def export_json_report(self):
-        """Export uploaded session data to JSON file"""
+        """Export database records to JSON file"""
         try:
             import json
             from datetime import datetime
 
+            db = get_db()
             data = []
-            for file_info in self.uploaded_files:
+            for row in db.get_all_files(limit=1000):
+                file_id = row["id"]
+                detections = db.get_detections_for_file(file_id)
+                redactions = db.get_redactions_for_file(file_id)
+                ocr = db.get_ocr_result(file_id)
                 data.append({
-                    'name': file_info.get('name'),
-                    'path': file_info.get('path'),
-                    'size': file_info.get('size'),
-                    'format': file_info.get('format'),
-                    'created': file_info.get('created'),
-                    'modified': file_info.get('modified'),
-                    'status': 'parsed' if 'parsed_content' in file_info else 'parse_error' if 'parse_error' in file_info else 'pending',
-                    'parse_error': file_info.get('parse_error'),
-                    'metadata': file_info.get('parsed_metadata', {}),
-                    'regex_summary': file_info.get('regex_summary', {}),
-                    'regex_findings': file_info.get('regex_findings', []),
+                    'id': file_id,
+                    'name': row.get('filename'),
+                    'path': row.get('file_path'),
+                    'size': row.get('file_size'),
+                    'format': row.get('file_format'),
+                    'file_hash': row.get('file_hash'),
+                    'upload_date': row.get('upload_date'),
+                    'risk_score': row.get('risk_score'),
+                    'risk_level': row.get('risk_level'),
+                    'post_redaction_risk_score': row.get('post_redaction_risk_score'),
+                    'post_redaction_risk_level': row.get('post_redaction_risk_level'),
+                    'post_redaction_findings_count': row.get('post_redaction_findings_count'),
+                    'redacted_path': row.get('redacted_version_path'),
+                    'findings_count': row.get('total_findings_count'),
+                    'entity_type_counts': row.get('entity_type_counts'),
+                    'detections': detections,
+                    'redactions': redactions,
+                    'ocr_summary': {
+                        'confidence': ocr.get('confidence') if ocr else None,
+                        'word_count': ocr.get('word_count') if ocr else None,
+                    } if ocr else None,
                 })
 
             json_data = json.dumps(data, indent=2)
@@ -1844,7 +2188,7 @@ class MainWindow(QMainWindow):
             report += f"\nExported Records:\n"
             report += f"  Total files: {len(data)}\n"
             
-            total_detections = sum(record.get('regex_summary', {}).get('total', 0) for record in data)
+            total_detections = sum(len(record.get('detections', [])) for record in data)
             report += f"  Total detections: {total_detections}\n"
             
             report += f"\nData is ready for analysis and backup."

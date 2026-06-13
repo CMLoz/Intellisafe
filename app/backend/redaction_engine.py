@@ -1,6 +1,6 @@
 """
 IntelliSafe - Redaction Engine
-Generates redacted copies of images and PDF documents.
+Generates redacted copies of images, PDF, Word, and text documents.
 """
 
 from __future__ import annotations
@@ -28,8 +28,15 @@ class RedactionEngine:
     """Create redacted versions of documents."""
 
     def __init__(self, output_dir: str = "redacted_output"):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.set_output_dir(output_dir)
+
+    def set_output_dir(self, output_dir: str) -> None:
+        """Set the directory where redacted files are written."""
+        path = Path(output_dir).expanduser()
+        if not path.is_absolute():
+            path = path.resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        self.output_dir = path
 
     # ------------------------------------------------------------------
     # Public API
@@ -106,7 +113,7 @@ class RedactionEngine:
         findings: List[Dict],
         strategy: str = "blackout",
     ) -> Dict:
-        """Create a redacted copy of a PDF file."""
+        """Create a redacted copy of a PDF by locating each finding in page text."""
         try:
             import fitz  # PyMuPDF
         except ImportError:
@@ -114,31 +121,29 @@ class RedactionEngine:
 
         doc = fitz.open(pdf_path)
         output_path = self.output_dir / f"redacted_{Path(pdf_path).name}"
+        page_count = len(doc)
         redacted_count = 0
+        pages_affected = set()
 
-        for page_num in range(len(doc)):
+        for page_num in range(page_count):
             page = doc[page_num]
-            page_width = page.rect.width
-            page_height = page.rect.height
+            page_redacted = False
 
             for finding in findings:
-                mode = self._mode_for(finding)
-                if mode == "full" or strategy == "blackout":
-                    coords = self._resolve_pdf_coords(finding, page_width, page_height)
-                    if coords is None:
-                        continue
-                    rect = fitz.Rect(*coords)
+                value = (finding.get("value") or "").strip()
+                if not value:
+                    continue
+                rects = self._pdf_search_rects(page, value)
+                if not rects:
+                    continue
+                for rect in rects:
                     page.add_redact_annot(rect, fill=(0, 0, 0))
                     redacted_count += 1
-                else:
-                    coords = self._resolve_pdf_coords(finding, page_width, page_height)
-                    if coords is None:
-                        continue
-                    rect = fitz.Rect(*coords)
-                    page.add_redact_annot(rect, fill=(0, 0, 0))
-                    redacted_count += 1
+                    page_redacted = True
 
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+            if page_redacted:
+                pages_affected.add(page_num)
+                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
         doc.save(str(output_path), deflate=True)
         doc.close()
@@ -148,7 +153,62 @@ class RedactionEngine:
             "format": "application/pdf",
             "strategy": strategy,
             "findings_redacted": redacted_count,
-            "pages_affected": len(doc) if isinstance(doc, fitz.Document) else 0,
+            "pages_affected": len(pages_affected),
+        }
+
+    def redact_docx(
+        self,
+        docx_path: str,
+        findings: List[Dict],
+    ) -> Dict:
+        """Create a redacted DOCX copy by replacing sensitive spans in-place."""
+        try:
+            from docx import Document
+        except ImportError:
+            raise RuntimeError(
+                "python-docx is required for Word redaction. Install with: pip install python-docx"
+            )
+
+        doc = Document(docx_path)
+        replacements = self._replacement_map(findings)
+        redacted_count = 0
+
+        def redact_paragraph(paragraph) -> int:
+            text = paragraph.text
+            count = 0
+            for old, new in replacements:
+                if not old or old not in text:
+                    continue
+                occurrences = text.count(old)
+                text = text.replace(old, new)
+                count += occurrences
+            if not count:
+                return 0
+            if paragraph.runs:
+                paragraph.runs[0].text = text
+                for run in paragraph.runs[1:]:
+                    run.text = ""
+            else:
+                paragraph.add_run(text)
+            return count
+
+        for paragraph in doc.paragraphs:
+            redacted_count += redact_paragraph(paragraph)
+
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        redacted_count += redact_paragraph(paragraph)
+
+        output_path = self.output_dir / f"redacted_{Path(docx_path).name}"
+        doc.save(str(output_path))
+
+        return {
+            "output_path": str(output_path),
+            "format": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "strategy": "replace",
+            "findings_redacted": redacted_count,
         }
 
     def redact_text_file(
@@ -200,6 +260,47 @@ class RedactionEngine:
         if ftype in FULL_REDACT_TYPES:
             return "full"
         return "partial"
+
+    def _replacement_map(self, findings: List[Dict]) -> List[Tuple[str, str]]:
+        """Build unique value→replacement pairs, longest values first."""
+        pairs: List[Tuple[str, str]] = []
+        seen = set()
+        for finding in sorted(findings, key=lambda item: len(item.get("value") or ""), reverse=True):
+            value = (finding.get("value") or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            mode = self._mode_for(finding)
+            if mode == "full" or finding.get("type") in FULL_REDACT_TYPES:
+                replacement = "[REDACTED]"
+            else:
+                replacement = self._partial_mask(value)
+            pairs.append((value, replacement))
+        return pairs
+
+    @staticmethod
+    def _pdf_search_rects(page, value: str) -> List:
+        """Find PDF rectangles for an exact text value on a page."""
+        import fitz
+
+        val = value.strip()
+        if not val:
+            return []
+
+        rects = list(page.search_for(val))
+        if rects:
+            return rects
+
+        # OCR / extraction may normalize whitespace differently.
+        collapsed = " ".join(val.split())
+        if collapsed != val:
+            rects = list(page.search_for(collapsed))
+            if rects:
+                return rects
+
+        if len(val) > 4:
+            rects = list(page.search_for(val, flags=fitz.TEXT_DEHYPHENATE))
+        return rects
 
     @staticmethod
     def _partial_mask(value: str, visible_prefix: int = 2, visible_suffix: int = 2) -> str:
